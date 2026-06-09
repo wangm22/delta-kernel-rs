@@ -11,7 +11,10 @@ use crate::partition::hive::{build_partition_path, uri_encode_path};
 use crate::schema::SchemaRef;
 use crate::table_features::ColumnMappingMode;
 #[cfg(feature = "check-constraints-in-dev")]
-use crate::{check_constraints::CheckConstraint, EngineData, EvaluationHandler};
+use crate::{
+    check_constraints::{CheckConstraint, CheckConstraintValidator},
+    EngineData, EvaluationHandler,
+};
 use crate::{DeltaResult, Error};
 
 /// Table-wide write state shared across all [`WriteContext`] instances created by a
@@ -215,21 +218,33 @@ impl WriteContext {
         &self.shared.check_constraints
     }
 
+    /// Binds the table's CHECK constraints to `evaluation_handler`, returning a
+    /// [`CheckConstraintValidator`] to run against every batch before writing it. Build the
+    /// validator once per write context and reuse it: construction fails closed immediately if
+    /// any constraint is not kernel-evaluable, and reuse amortizes predicate-evaluator creation
+    /// across batches.
+    #[cfg(feature = "check-constraints-in-dev")]
+    pub fn check_constraint_validator(
+        &self,
+        evaluation_handler: &dyn EvaluationHandler,
+    ) -> DeltaResult<CheckConstraintValidator> {
+        CheckConstraintValidator::try_new(&self.shared.check_constraints, evaluation_handler)
+    }
+
     /// Validates `batch` (logical data, matching [`Self::logical_schema`]) against every CHECK
     /// constraint on the table, erroring on the first violation and failing closed on
-    /// constraints kernel could not parse. The default engine's `write_parquet` calls this
-    /// automatically; custom engines should call it (or otherwise enforce each constraint)
-    /// on every batch before writing.
+    /// constraints kernel cannot evaluate. The default engine's `write_parquet` calls this
+    /// automatically; custom engines should call it (or otherwise enforce each constraint) on
+    /// every batch before writing. To validate many batches, prefer building a
+    /// [`Self::check_constraint_validator`] once and reusing it.
     #[cfg(feature = "check-constraints-in-dev")]
     pub fn validate_check_constraints(
         &self,
         batch: &dyn EngineData,
         evaluation_handler: &dyn EvaluationHandler,
     ) -> DeltaResult<()> {
-        self.shared
-            .check_constraints
-            .iter()
-            .try_for_each(|constraint| constraint.validate(batch, evaluation_handler))
+        self.check_constraint_validator(evaluation_handler)?
+            .validate(batch)
     }
 
     /// Builds the Hive-style partition path suffix (e.g., `year=2024/region=US/`).

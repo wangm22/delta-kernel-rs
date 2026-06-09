@@ -66,11 +66,20 @@ mod enabled {
 
     use super::*;
 
-    /// Creates a table with the given `delta.constraints.<name>` entries and returns
-    /// `(table_url, engine)`.
+    /// Creates an unpartitioned table with the given `delta.constraints.<name>` entries and
+    /// returns `(table_url, engine)`.
     async fn setup_constrained_table(
         test_name: &str,
         constraints: &[(&str, &str)],
+    ) -> Result<(Url, DefaultEngine<TokioBackgroundExecutor>), Box<dyn std::error::Error>> {
+        setup_constrained_table_partitioned(test_name, constraints, &[]).await
+    }
+
+    /// Like [`setup_constrained_table`], with partition columns.
+    async fn setup_constrained_table_partitioned(
+        test_name: &str,
+        constraints: &[(&str, &str)],
+        partition_columns: &[&str],
     ) -> Result<(Url, DefaultEngine<TokioBackgroundExecutor>), Box<dyn std::error::Error>> {
         let (store, engine, table_location): (Arc<DynObjectStore>, _, _) =
             engine_store_setup(test_name, None);
@@ -82,7 +91,7 @@ mod enabled {
             store,
             table_location,
             test_schema(),
-            &[],
+            partition_columns,
             true,
             vec![],
             vec!["checkConstraints"],
@@ -167,7 +176,7 @@ mod enabled {
             .expect("table has exactly one constraint");
         assert_eq!(constraint.name(), "positive_amount");
         assert_eq!(constraint.raw_sql(), "amount > 0");
-        assert!(constraint.is_kernel_parsable());
+        assert!(constraint.is_kernel_evaluable());
 
         let evaluation_handler = engine.evaluation_handler();
 
@@ -224,7 +233,7 @@ mod enabled {
     }
 
     /// Constraints kernel cannot parse (here: a junction, outside the simple-comparison
-    /// subset) are surfaced via `is_kernel_parsable` and fail the DefaultEngine path closed.
+    /// subset) are surfaced via `is_kernel_evaluable` and fail the DefaultEngine path closed.
     #[tokio::test]
     async fn non_parsable_constraint_fails_closed() -> Result<(), Box<dyn std::error::Error>> {
         let (table_url, engine) = setup_constrained_table(
@@ -240,7 +249,7 @@ mod enabled {
             .iter()
             .exactly_one()
             .expect("table has exactly one constraint");
-        assert!(!constraint.is_kernel_parsable());
+        assert!(!constraint.is_kernel_evaluable());
         assert_eq!(constraint.raw_sql(), "amount > 0 AND amount < 100");
 
         // The DefaultEngine path cannot evaluate it, so it must not write at all.
@@ -251,7 +260,7 @@ mod enabled {
             .await
             .map(|_| ())
             .expect_err("non-parsable constraint must fail closed");
-        assert_err_contains(err, "not kernel-parsable");
+        assert_err_contains(err, "must enforce");
         Ok(())
     }
 
@@ -269,6 +278,90 @@ mod enabled {
         let add_files_metadata = engine.write_parquet(&data, &write_context).await?;
         txn.add_files(add_files_metadata);
         txn.commit(&engine)?.unwrap_committed();
+        Ok(())
+    }
+
+    /// Constraints referencing a partition column are not kernel-evaluable (partition values
+    /// are per-file constants from the write context, not batch columns); constraints on data
+    /// columns of the same partitioned table still are.
+    #[tokio::test]
+    async fn partition_column_constraint_not_evaluable() -> Result<(), Box<dyn std::error::Error>> {
+        let (table_url, engine) = setup_constrained_table_partitioned(
+            "test_cc_partition_col",
+            &[
+                ("name_check", "name = 'a'"),
+                ("positive_amount", "amount > 0"),
+            ],
+            &["name"],
+        )
+        .await?;
+        let txn = begin_txn(&table_url, &engine)?.with_check_constraints();
+        let constraints = txn.check_constraints();
+
+        let name_check = constraints
+            .iter()
+            .find(|c| c.name() == "name_check")
+            .expect("name_check constraint exists");
+        assert!(!name_check.is_kernel_evaluable());
+        assert_eq!(name_check.raw_sql(), "name = 'a'"); // raw SQL exposed for self-enforcement
+
+        let positive_amount = constraints
+            .iter()
+            .find(|c| c.name() == "positive_amount")
+            .expect("positive_amount constraint exists");
+        assert!(positive_amount.is_kernel_evaluable());
+
+        // Validating the partition-column constraint fails closed with a targeted error.
+        let data = batch(vec![Some(1)], vec!["a"])?;
+        let err = name_check
+            .validate(&data, engine.evaluation_handler().as_ref())
+            .expect_err("partition-column constraint must fail closed");
+        assert_err_contains(err, "partition column 'name'");
+        Ok(())
+    }
+
+    /// A `CheckConstraintValidator` binds evaluators once and validates many batches; a
+    /// violation surfaces as the matchable `Error::CheckConstraintViolation` variant.
+    #[tokio::test]
+    async fn validator_binds_once_and_reports_typed_violations(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (table_url, engine) = setup_constrained_table(
+            "test_cc_validator_reuse",
+            &[
+                ("max_amount", "amount < 100"),
+                ("positive_amount", "amount > 0"),
+            ],
+        )
+        .await?;
+        let txn = begin_txn(&table_url, &engine)?.with_check_constraints();
+        let write_context = txn.unpartitioned_write_context()?;
+
+        // Bind once...
+        let evaluation_handler = engine.evaluation_handler();
+        let validator = write_context.check_constraint_validator(evaluation_handler.as_ref())?;
+
+        // ...validate many batches.
+        validator.validate(&batch(vec![Some(1), Some(2)], vec!["a", "b"])?)?;
+        validator.validate(&batch(vec![Some(50)], vec!["c"])?)?;
+
+        let err = validator
+            .validate(&batch(vec![Some(150)], vec!["d"])?)
+            .expect_err("violating batch must error");
+        match err {
+            Error::CheckConstraintViolation {
+                name,
+                expression,
+                details,
+            } => {
+                assert_eq!(name, "max_amount");
+                assert_eq!(expression, "amount < 100");
+                assert!(
+                    details.contains("row 0"),
+                    "details locate the row: {details}"
+                );
+            }
+            other => panic!("expected CheckConstraintViolation, got: {other:?}"),
+        }
         Ok(())
     }
 }

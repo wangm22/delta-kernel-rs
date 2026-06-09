@@ -573,6 +573,7 @@ impl<S> Transaction<S> {
         crate::check_constraints::constraints_from_configuration(
             table_config.metadata().configuration(),
             table_config.logical_schema(),
+            table_config.partition_columns(),
         )
     }
 
@@ -972,6 +973,7 @@ impl<S: SupportsDataFiles> Transaction<S> {
                 check_constraints: crate::check_constraints::constraints_from_configuration(
                     table_config.metadata().configuration(),
                     table_config.logical_schema(),
+                    table_config.partition_columns(),
                 ),
             })
         })

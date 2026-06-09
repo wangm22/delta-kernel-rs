@@ -47,7 +47,7 @@ mod token;
 ///
 /// Returns an error for any input outside the supported grammar (functions, arithmetic, `IN`,
 /// `BETWEEN`, ...), for unknown columns, and for type-incompatible literals. Callers treat that
-/// error as the signal that a constraint is *not kernel-parsable*.
+/// error as the signal that a constraint is not kernel-evaluable.
 #[cfg(feature = "check-constraints-in-dev")]
 pub(crate) fn parse_sql_predicate(sql: &str, schema: &StructType) -> DeltaResult<Predicate> {
     let tokens = token::tokenize(sql)?;
