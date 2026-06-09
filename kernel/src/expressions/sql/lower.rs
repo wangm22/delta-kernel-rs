@@ -94,7 +94,23 @@ fn resolve_operand(
                     "cannot type literal '{raw}': a CHECK constraint comparison must reference a column"
                 ))
             })?;
-            Ok((parse_sql(raw, data_type)?, None))
+            let expression = parse_sql(raw, data_type).or_else(|parse_err| {
+                // Delta-Spark accepts quoted literals compared against non-string columns by
+                // implicitly casting (e.g. `num < '10'` is a legal, tested constraint); mirror
+                // that by parsing the unquoted body as the column's type. `parse_sql` itself
+                // rejects this form on purpose (a quoted default for a numeric column is a
+                // likely mistake), so the coercion lives here, in the comparison path, where
+                // the intent is unambiguous.
+                let DataType::Primitive(primitive) = data_type else {
+                    return Err(parse_err);
+                };
+                if !raw.starts_with('\'') {
+                    return Err(parse_err);
+                }
+                let unquoted = super::unquote_string(raw)?;
+                Ok(Expression::literal(primitive.parse_scalar(&unquoted)?))
+            })?;
+            Ok((expression, None))
         }
     }
 }
@@ -221,6 +237,34 @@ mod tests {
     #[test]
     fn rejects_comparison_of_two_literals() {
         assert!(parse_sql_predicate("1 > 0", &schema()).is_err());
+    }
+
+    // Delta-Spark coerces quoted literals compared against non-string columns (`num < '10'` is
+    // a legal, tested constraint); the unquoted body parses as the column's type.
+    #[test]
+    fn coerces_quoted_literals_for_non_string_columns() {
+        let pred = parse_sql_predicate("amount < '10'", &schema()).unwrap();
+        assert_eq!(
+            pred,
+            Predicate::lt(col("amount"), Expression::literal(10i64))
+        );
+
+        // The literal side may come first; the hint still flows from the column side.
+        let pred = parse_sql_predicate("'10' >= amount", &schema()).unwrap();
+        assert_eq!(
+            pred,
+            Predicate::ge(Expression::literal(10i64), col("amount"))
+        );
+
+        // Boolean columns coerce the same way.
+        let pred = parse_sql_predicate("active = 'true'", &schema()).unwrap();
+        assert_eq!(
+            pred,
+            Predicate::eq(col("active"), Expression::literal(true))
+        );
+
+        // A body that cannot parse as the column type still fails.
+        assert!(parse_sql_predicate("amount < 'abc'", &schema()).is_err());
     }
 
     #[test]

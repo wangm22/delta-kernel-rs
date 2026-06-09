@@ -33,20 +33,37 @@ use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
-use crate::expressions::{parse_sql_simple_predicate, Scalar};
+use crate::expressions::UnaryExpressionOp::ToJson;
+use crate::expressions::{parse_sql_simple_predicate, Expression, Predicate, Scalar};
 use crate::kernel_predicates::{DefaultKernelPredicateEvaluator, KernelPredicateEvaluator as _};
-use crate::schema::{column_name, ColumnName, ColumnNamesAndTypes, DataType, SchemaRef};
+use crate::schema::{
+    column_name, ColumnName, ColumnNamesAndTypes, DataType, SchemaRef, StructField, StructType,
+};
 use crate::utils::require;
-use crate::{DeltaResult, EngineData, Error, EvaluationHandler, PredicateEvaluator, PredicateRef};
+use crate::{
+    DeltaResult, EngineData, Error, EvaluationHandler, ExpressionEvaluator, PredicateEvaluator,
+    PredicateRef,
+};
 
 /// Table-configuration key prefix under which CHECK constraints are stored.
 pub(crate) const CHECK_CONSTRAINT_PREFIX: &str = "delta.constraints.";
+
+/// Returns the constraint name if `key` is a CHECK-constraint configuration key. Delta-Spark
+/// matches the `delta.constraints.` prefix case-insensitively when discovering constraints, so
+/// kernel must too -- otherwise kernel could ignore (and write past) a constraint other writers
+/// enforce.
+fn strip_constraint_prefix(key: &str) -> Option<&str> {
+    let prefix = key.get(..CHECK_CONSTRAINT_PREFIX.len())?;
+    prefix
+        .eq_ignore_ascii_case(CHECK_CONSTRAINT_PREFIX)
+        .then(|| &key[CHECK_CONSTRAINT_PREFIX.len()..])
+}
 
 /// Returns true if the table configuration contains any CHECK constraints.
 pub(crate) fn has_check_constraints(configuration: &HashMap<String, String>) -> bool {
     configuration
         .keys()
-        .any(|key| key.starts_with(CHECK_CONSTRAINT_PREFIX))
+        .any(|key| strip_constraint_prefix(key).is_some())
 }
 
 /// Extracts all CHECK constraints from the table configuration, attempting to parse each one
@@ -61,7 +78,7 @@ pub(crate) fn constraints_from_configuration(
     let mut constraints: Vec<_> = configuration
         .iter()
         .filter_map(|(key, sql)| {
-            let name = key.strip_prefix(CHECK_CONSTRAINT_PREFIX)?;
+            let name = strip_constraint_prefix(key)?;
             Some(CheckConstraint::new(
                 name,
                 sql,
@@ -95,11 +112,24 @@ pub(crate) fn enforce_on_partition_values(
         };
         let result = evaluator.eval(predicate);
         if result != Some(true) {
+            // Report the referenced partition values alongside the verdict (mirrors
+            // Delta-Spark's violation messages, which list the violating values).
+            let mut referenced: Vec<String> = predicate
+                .references()
+                .into_iter()
+                .filter_map(|column| {
+                    let top_level = column.path().first()?;
+                    let value = partition_values.get(top_level)?;
+                    Some(format!("{top_level} = {value}"))
+                })
+                .collect();
+            referenced.sort();
             return Err(Error::CheckConstraintViolation {
                 name: constraint.name.clone(),
                 expression: constraint.raw_sql.clone(),
                 details: format!(
-                    "the write context's partition values evaluated to {}",
+                    "the write context's partition values ({}) evaluated to {}",
+                    referenced.join(", "),
                     match result {
                         Some(_) => "false",
                         None => "NULL",
@@ -140,8 +170,9 @@ enum ConstraintSupport {
         predicate: PredicateRef,
         column: String,
     },
-    /// The expression is outside the subset kernel's constraint parser supports.
-    Unsupported,
+    /// The expression is outside the subset kernel's constraint parser supports; the payload is
+    /// the parser's reason (e.g. an unresolved column vs. unsupported grammar).
+    Unsupported(String),
 }
 
 /// One CHECK constraint: its name, the raw SQL stored under `delta.constraints.<name>`, and the
@@ -165,7 +196,7 @@ impl CheckConstraint {
     ) -> Self {
         let raw_sql = raw_sql.into();
         let support = match parse_sql_simple_predicate(&raw_sql, &schema) {
-            Err(_) => ConstraintSupport::Unsupported,
+            Err(reason) => ConstraintSupport::Unsupported(reason.to_string()),
             Ok(predicate) => {
                 // The lowered predicate uses canonical (schema-cased) column names, and metadata
                 // partition columns are schema-cased too; compare case-insensitively anyway to be
@@ -209,7 +240,7 @@ impl CheckConstraint {
             ConstraintSupport::PartitionValues { .. } => {
                 CheckConstraintEnforcement::PartitionValues
             }
-            ConstraintSupport::Unsupported => CheckConstraintEnforcement::Connector,
+            ConstraintSupport::Unsupported(_) => CheckConstraintEnforcement::Connector,
         }
     }
 
@@ -220,7 +251,7 @@ impl CheckConstraint {
         match &self.support {
             ConstraintSupport::DataBatches(predicate) => Some(predicate),
             ConstraintSupport::PartitionValues { predicate, .. } => Some(predicate),
-            ConstraintSupport::Unsupported => None,
+            ConstraintSupport::Unsupported(_) => None,
         }
     }
 
@@ -255,11 +286,100 @@ impl CheckConstraint {
 
     /// The fail-closed error for constraints kernel cannot evaluate at all.
     fn connector_enforced_error(&self) -> Error {
+        let reason = match &self.support {
+            ConstraintSupport::Unsupported(reason) => reason.as_str(),
+            _ => "constraint is kernel-evaluable",
+        };
         Error::unsupported(format!(
-            "CHECK constraint '{}' ({}) is outside the subset kernel can evaluate; the \
-             connector must enforce it with its own SQL engine before writing",
-            self.name, self.raw_sql
+            "CHECK constraint '{}' ({}) cannot be evaluated by kernel ({}); the connector must \
+             enforce it with its own SQL engine before writing",
+            self.name, self.raw_sql, reason
         ))
+    }
+}
+
+// Output column names of the two value-rendering stages; see [`ViolationValuesRenderer`].
+const REFERENCED_COLUMN: &str = "referenced";
+const VALUES_COLUMN: &str = "values";
+
+/// Renders the columns a constraint references as one JSON object per row, used to include the
+/// violating row's values in [`Error::CheckConstraintViolation`] (mirroring Delta-Spark's
+/// violation messages). Rendering is best-effort: it runs only after a violation is found, and
+/// any rendering failure simply omits the values from the error.
+///
+/// Two evaluator stages are needed because the JSON encoder requires a *named* struct column as
+/// input: stage one materializes the referenced columns as a struct column (names come from the
+/// output schema), stage two JSON-encodes that column to a single STRING column.
+struct ViolationValuesRenderer {
+    referenced: Arc<dyn ExpressionEvaluator>,
+    to_json: Arc<dyn ExpressionEvaluator>,
+}
+
+impl ViolationValuesRenderer {
+    fn try_new(
+        schema: &SchemaRef,
+        predicate: &Predicate,
+        evaluation_handler: &dyn EvaluationHandler,
+    ) -> DeltaResult<Self> {
+        // Sort the referenced columns for deterministic output (Delta-Spark does the same).
+        let mut columns: Vec<&ColumnName> = predicate.references().into_iter().collect();
+        columns.sort_by(|a, b| a.path().cmp(b.path()));
+
+        let mut fields = Vec::with_capacity(columns.len());
+        let mut field_exprs: Vec<Expression> = Vec::with_capacity(columns.len());
+        for column in columns {
+            let leaf = schema
+                .walk_column_fields(column)?
+                .last()
+                .ok_or_else(|| Error::internal_error("empty column path in predicate"))?
+                .data_type()
+                .clone();
+            // Flatten nested references to their dotted display name; the name only feeds the
+            // rendered JSON keys.
+            fields.push(StructField::nullable(column.path().join("."), leaf));
+            field_exprs.push(column.clone().into());
+        }
+        let referenced_schema = Arc::new(StructType::new_unchecked([StructField::nullable(
+            REFERENCED_COLUMN,
+            DataType::Struct(Box::new(StructType::new_unchecked(fields))),
+        )]));
+        let referenced = evaluation_handler.new_expression_evaluator(
+            schema.clone(),
+            Arc::new(Expression::struct_from([Expression::struct_from(
+                field_exprs,
+            )])),
+            DataType::Struct(Box::new(referenced_schema.as_ref().clone())),
+        )?;
+
+        let json_schema =
+            StructType::new_unchecked([StructField::nullable(VALUES_COLUMN, DataType::STRING)]);
+        let to_json = evaluation_handler.new_expression_evaluator(
+            referenced_schema,
+            Arc::new(Expression::struct_from([Expression::unary(
+                ToJson,
+                Expression::column([REFERENCED_COLUMN]),
+            )])),
+            DataType::Struct(Box::new(json_schema)),
+        )?;
+
+        Ok(Self {
+            referenced,
+            to_json,
+        })
+    }
+
+    /// Renders the referenced-column values of `row` (an index into `batch`), or `None` if any
+    /// step fails.
+    fn render(&self, batch: &dyn EngineData, row: usize) -> Option<String> {
+        let referenced = self.referenced.evaluate(batch).ok()?;
+        let json = self.to_json.evaluate(referenced.as_ref()).ok()?;
+        let mut visitor = StringAtRowVisitor {
+            target_row: row,
+            rows_visited: 0,
+            value: None,
+        };
+        visitor.visit_rows_of(json.as_ref()).ok()?;
+        visitor.value
     }
 }
 
@@ -268,6 +388,7 @@ struct BoundConstraint {
     name: String,
     raw_sql: String,
     evaluator: Arc<dyn PredicateEvaluator>,
+    values_renderer: Option<ViolationValuesRenderer>,
 }
 
 /// The table's data-batch-enforced CHECK constraints bound to an engine's [`EvaluationHandler`],
@@ -303,11 +424,21 @@ impl CheckConstraintValidator {
                             name: constraint.name.clone(),
                             raw_sql: constraint.raw_sql.clone(),
                             evaluator,
+                            // Rendering violating values is a best-effort nicety; never fail
+                            // binding over it.
+                            values_renderer: ViolationValuesRenderer::try_new(
+                                &constraint.schema,
+                                predicate,
+                                evaluation_handler,
+                            )
+                            .ok(),
                         }),
                 ),
                 // Enforced against the write context's partition values, not data batches.
                 ConstraintSupport::PartitionValues { .. } => None,
-                ConstraintSupport::Unsupported => Some(Err(constraint.connector_enforced_error())),
+                ConstraintSupport::Unsupported(_) => {
+                    Some(Err(constraint.connector_enforced_error()))
+                }
             })
             .collect::<DeltaResult<_>>()?;
         Ok(Self { bound })
@@ -322,28 +453,54 @@ impl CheckConstraintValidator {
     /// [`Error::CheckConstraintViolation`] on the first row whose predicate does not evaluate to
     /// exactly `true` (`false` and `NULL` are both violations), or any engine evaluation error.
     pub fn validate(&self, batch: &dyn EngineData) -> DeltaResult<()> {
-        self.bound.iter().try_for_each(|constraint| {
+        for constraint in &self.bound {
             let result = constraint.evaluator.evaluate(batch)?;
-            let mut visitor = CheckResultVisitor {
-                name: &constraint.name,
-                raw_sql: &constraint.raw_sql,
-                rows_visited: 0,
+            let mut visitor = CheckResultVisitor::default();
+            visitor.visit_rows_of(result.as_ref())?;
+            let Some(violation) = visitor.violation else {
+                continue;
             };
-            visitor.visit_rows_of(result.as_ref())
-        })
+            let values = constraint
+                .values_renderer
+                .as_ref()
+                .and_then(|renderer| renderer.render(batch, violation.row))
+                .map(|json| format!("; values: {json}"))
+                .unwrap_or_default();
+            return Err(Error::CheckConstraintViolation {
+                name: constraint.name.clone(),
+                expression: constraint.raw_sql.clone(),
+                details: format!(
+                    "row {} of the batch evaluated to {}{}",
+                    violation.row,
+                    if violation.result_was_null {
+                        "NULL"
+                    } else {
+                        "false"
+                    },
+                    values,
+                ),
+            });
+        }
+        Ok(())
     }
 }
 
-/// Visits the boolean "output" column produced by evaluating a constraint predicate, erroring on
-/// the first row that is not exactly `true` (`NULL` counts as a violation, matching the
-/// protocol's "must return true" rule and NOT NULL invariants).
-struct CheckResultVisitor<'a> {
-    name: &'a str,
-    raw_sql: &'a str,
-    rows_visited: usize,
+/// The first violating row found while scanning a constraint's boolean "output" column.
+struct FirstViolation {
+    row: usize,
+    result_was_null: bool,
 }
 
-impl RowVisitor for CheckResultVisitor<'_> {
+/// Visits the boolean "output" column produced by evaluating a constraint predicate, recording
+/// the first row that is not exactly `true` (`NULL` counts as a violation, matching the
+/// protocol's "must return true" rule and NOT NULL invariants).
+#[derive(Default)]
+struct CheckResultVisitor {
+    rows_visited: usize,
+    violation: Option<FirstViolation>,
+}
+
+impl RowVisitor for CheckResultVisitor {
     fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
         static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> =
             LazyLock::new(|| (vec![column_name!("output")], vec![DataType::BOOLEAN]).into());
@@ -358,21 +515,48 @@ impl RowVisitor for CheckResultVisitor<'_> {
                 getters.len()
             ))
         );
-        for i in 0..row_count {
-            let passed: Option<bool> = getters[0].get_opt(i, "check_constraint.output")?;
-            if passed != Some(true) {
-                return Err(Error::CheckConstraintViolation {
-                    name: self.name.to_string(),
-                    expression: self.raw_sql.to_string(),
-                    details: format!(
-                        "row {} of the batch evaluated to {}",
-                        self.rows_visited + i,
-                        match passed {
-                            Some(_) => "false",
-                            None => "NULL",
-                        },
-                    ),
-                });
+        if self.violation.is_none() {
+            for i in 0..row_count {
+                let passed: Option<bool> = getters[0].get_opt(i, "check_constraint.output")?;
+                if passed != Some(true) {
+                    self.violation = Some(FirstViolation {
+                        row: self.rows_visited + i,
+                        result_was_null: passed.is_none(),
+                    });
+                    break;
+                }
+            }
+        }
+        self.rows_visited += row_count;
+        Ok(())
+    }
+}
+
+/// Extracts the STRING "values" column at one target row.
+struct StringAtRowVisitor {
+    target_row: usize,
+    rows_visited: usize,
+    value: Option<String>,
+}
+
+impl RowVisitor for StringAtRowVisitor {
+    fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
+        static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> =
+            LazyLock::new(|| (vec![column_name!("values")], vec![DataType::STRING]).into());
+        NAMES_AND_TYPES.as_ref()
+    }
+
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
+        require!(
+            getters.len() == 1,
+            Error::InternalError(format!(
+                "Wrong number of StringAtRowVisitor getters: {}",
+                getters.len()
+            ))
+        );
+        if let Some(i) = self.target_row.checked_sub(self.rows_visited) {
+            if i < row_count {
+                self.value = getters[0].get_opt(i, "check_constraint.values")?;
             }
         }
         self.rows_visited += row_count;
@@ -400,15 +584,24 @@ mod tests {
     }
 
     #[test]
-    fn has_check_constraints_matches_prefix_only() {
+    fn constraint_prefix_matches_case_insensitively() {
+        // Delta-Spark discovers the prefix case-insensitively; kernel must not ignore a
+        // constraint other writers enforce.
         assert!(!has_check_constraints(&config(&[(
             "delta.appendOnly",
             "true"
         )])));
-        assert!(has_check_constraints(&config(&[
-            ("delta.appendOnly", "true"),
-            ("delta.constraints.positive", "amount > 0"),
-        ])));
+        for key in [
+            "delta.constraints.positive",
+            "DELTA.CONSTRAINTS.positive",
+            "Delta.Constraints.positive",
+        ] {
+            let config = config(&[(key, "amount > 0")]);
+            assert!(has_check_constraints(&config), "prefix of {key} matches");
+            let constraints = constraints_from_configuration(&config, schema(), &[]);
+            assert_eq!(constraints.len(), 1, "constraint under {key} discovered");
+            assert_eq!(constraints[0].name(), "positive");
+        }
     }
 
     #[test]
@@ -428,13 +621,42 @@ mod tests {
     }
 
     #[test]
-    fn junctions_unknown_columns_and_functions_are_connector_enforced() {
-        for sql in [
-            "amount > 0 AND amount < 100", // junctions unsupported in the simple subset
-            "nope > 0",                    // unknown column
-            "length(name) > 0",            // function call
-            "amount IS NOT NULL",          // null checks unsupported in the simple subset
-        ] {
+    fn token_spaced_and_parenthesized_expressions_are_evaluable() {
+        // Delta-Spark stores parser-round-tripped, token-spaced expression text (e.g.
+        // `concat ( num , text ) != '9i'`); simple comparisons must tolerate the same style.
+        let constraint = CheckConstraint::new("p", "( amount > 0 )", schema(), &[]);
+        assert_eq!(
+            constraint.enforcement(),
+            CheckConstraintEnforcement::DataBatches
+        );
+    }
+
+    #[test]
+    fn connector_enforced_errors_preserve_the_parser_reason() {
+        // Unsupported grammar and unresolvable columns are different failure modes (Delta-Spark
+        // raises distinct error classes); the fail-closed error must say which one applies.
+        let junction = CheckConstraint::new("range", "amount > 0 AND amount < 100", schema(), &[]);
+        assert_eq!(
+            junction.enforcement(),
+            CheckConstraintEnforcement::Connector
+        );
+        let msg = junction.connector_enforced_error().to_string();
+        assert!(
+            msg.contains("only simple comparison"),
+            "junction reason surfaces: {msg}"
+        );
+
+        let unknown_column = CheckConstraint::new("ghost", "nope > 0", schema(), &[]);
+        let msg = unknown_column.connector_enforced_error().to_string();
+        assert!(
+            msg.contains("not found in schema"),
+            "unresolved-column reason surfaces: {msg}"
+        );
+    }
+
+    #[test]
+    fn functions_and_null_checks_are_connector_enforced() {
+        for sql in ["length(name) > 0", "amount IS NOT NULL"] {
             let constraint = CheckConstraint::new("c", sql, schema(), &[]);
             assert_eq!(
                 constraint.enforcement(),
@@ -482,7 +704,7 @@ mod tests {
         // `amount` is not a partition value.
         enforce_on_partition_values(&constraints, &values(Scalar::from("a"))).unwrap();
 
-        // A false result is a violation.
+        // A false result is a violation, and the details report the offending values.
         let err = enforce_on_partition_values(&constraints, &values(Scalar::from("b")))
             .expect_err("non-matching partition value must violate");
         let Error::CheckConstraintViolation { name, details, .. } = err else {
@@ -490,6 +712,10 @@ mod tests {
         };
         assert_eq!(name, "name_check");
         assert!(details.contains("false"), "details report false: {details}");
+        assert!(
+            details.contains("name = "),
+            "details include the partition value: {details}"
+        );
 
         // A NULL partition value is also a violation (only `true` passes).
         let err =

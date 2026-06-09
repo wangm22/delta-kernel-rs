@@ -211,9 +211,12 @@ mod enabled {
     /// `write_parquet`; a satisfying write commits and round-trips.
     #[tokio::test]
     async fn default_engine_auto_enforces_on_write() -> Result<(), Box<dyn std::error::Error>> {
-        let (table_url, engine) =
-            setup_constrained_table("test_cc_auto_enforce", &[("positive_amount", "amount > 0")])
-                .await?;
+        // Spark stores parser-round-tripped, token-spaced expression text; use that style here.
+        let (table_url, engine) = setup_constrained_table(
+            "test_cc_auto_enforce",
+            &[("positive_amount", "( amount > 0 )")],
+        )
+        .await?;
         let mut txn = begin_txn(&table_url, &engine)?
             .with_check_constraints()
             .with_operation("WRITE".to_string());
@@ -403,6 +406,11 @@ mod enabled {
                 assert!(
                     details.contains("row 0"),
                     "details locate the row: {details}"
+                );
+                // Mirrors Delta-Spark: the violating row's referenced-column values appear.
+                assert!(
+                    details.contains("amount") && details.contains("150"),
+                    "details include the violating values: {details}"
                 );
             }
             other => panic!("expected CheckConstraintViolation, got: {other:?}"),
