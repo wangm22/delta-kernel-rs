@@ -51,12 +51,16 @@ async fn write_blocked_when_cargo_feature_off() -> Result<(), Box<dyn std::error
 
 #[cfg(feature = "check-constraints-in-dev")]
 mod enabled {
+    use std::collections::HashMap;
+
     use delta_kernel::arrow::array::{ArrayRef, Int64Array, StringArray};
     use delta_kernel::arrow::record_batch::RecordBatch;
+    use delta_kernel::check_constraints::CheckConstraintEnforcement;
     use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
     use delta_kernel::engine::arrow_data::ArrowEngineData;
     use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
     use delta_kernel::engine::default::DefaultEngine;
+    use delta_kernel::expressions::Scalar;
     use delta_kernel::object_store::DynObjectStore;
     use delta_kernel::transaction::Transaction;
     use delta_kernel::{Engine as _, Error};
@@ -176,7 +180,10 @@ mod enabled {
             .expect("table has exactly one constraint");
         assert_eq!(constraint.name(), "positive_amount");
         assert_eq!(constraint.raw_sql(), "amount > 0");
-        assert!(constraint.is_kernel_evaluable());
+        assert_eq!(
+            constraint.enforcement(),
+            CheckConstraintEnforcement::DataBatches
+        );
 
         let evaluation_handler = engine.evaluation_handler();
 
@@ -233,7 +240,7 @@ mod enabled {
     }
 
     /// Constraints kernel cannot parse (here: a junction, outside the simple-comparison
-    /// subset) are surfaced via `is_kernel_evaluable` and fail the DefaultEngine path closed.
+    /// subset) are surfaced as connector-enforced and fail the DefaultEngine path closed.
     #[tokio::test]
     async fn non_parsable_constraint_fails_closed() -> Result<(), Box<dyn std::error::Error>> {
         let (table_url, engine) = setup_constrained_table(
@@ -249,7 +256,10 @@ mod enabled {
             .iter()
             .exactly_one()
             .expect("table has exactly one constraint");
-        assert!(!constraint.is_kernel_evaluable());
+        assert_eq!(
+            constraint.enforcement(),
+            CheckConstraintEnforcement::Connector
+        );
         assert_eq!(constraint.raw_sql(), "amount > 0 AND amount < 100");
 
         // The DefaultEngine path cannot evaluate it, so it must not write at all.
@@ -281,11 +291,13 @@ mod enabled {
         Ok(())
     }
 
-    /// Constraints referencing a partition column are not kernel-evaluable (partition values
-    /// are per-file constants from the write context, not batch columns); constraints on data
-    /// columns of the same partitioned table still are.
+    /// Constraints referencing a partition column are enforced by kernel itself (no engine)
+    /// against the partition values when the partitioned write context is created; constraints
+    /// on data columns of the same table stay batch-enforced. A satisfying write commits and
+    /// round-trips, with the partition column reconstructed from `add.partitionValues`.
     #[tokio::test]
-    async fn partition_column_constraint_not_evaluable() -> Result<(), Box<dyn std::error::Error>> {
+    async fn partition_column_constraint_enforced_on_write_context(
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let (table_url, engine) = setup_constrained_table_partitioned(
             "test_cc_partition_col",
             &[
@@ -295,28 +307,61 @@ mod enabled {
             &["name"],
         )
         .await?;
-        let txn = begin_txn(&table_url, &engine)?.with_check_constraints();
-        let constraints = txn.check_constraints();
+        let mut txn = begin_txn(&table_url, &engine)?
+            .with_check_constraints()
+            .with_operation("WRITE".to_string());
 
+        let constraints = txn.check_constraints();
         let name_check = constraints
             .iter()
             .find(|c| c.name() == "name_check")
             .expect("name_check constraint exists");
-        assert!(!name_check.is_kernel_evaluable());
-        assert_eq!(name_check.raw_sql(), "name = 'a'"); // raw SQL exposed for self-enforcement
-
-        let positive_amount = constraints
-            .iter()
-            .find(|c| c.name() == "positive_amount")
-            .expect("positive_amount constraint exists");
-        assert!(positive_amount.is_kernel_evaluable());
-
-        // Validating the partition-column constraint fails closed with a targeted error.
-        let data = batch(vec![Some(1)], vec!["a"])?;
+        assert_eq!(
+            name_check.enforcement(),
+            CheckConstraintEnforcement::PartitionValues
+        );
+        // Batch validation is the wrong tool for a partition-value-enforced constraint.
         let err = name_check
-            .validate(&data, engine.evaluation_handler().as_ref())
-            .expect_err("partition-column constraint must fail closed");
+            .validate(
+                &batch(vec![Some(1)], vec!["a"])?,
+                engine.evaluation_handler().as_ref(),
+            )
+            .expect_err("batch validation must redirect to partition-value enforcement");
         assert_err_contains(err, "partition column 'name'");
+
+        // Violating partition values reject the write context outright...
+        let partition = |name: Scalar| HashMap::from([("name".to_string(), name)]);
+        let err = txn
+            .partitioned_write_context(partition(Scalar::from("b")))
+            .map(|_| ())
+            .expect_err("partition value 'b' must violate name_check");
+        assert_err_contains(err, "name_check");
+
+        // ...as do NULL partition values (only `true` passes).
+        let err = txn
+            .partitioned_write_context(partition(Scalar::Null(DataType::STRING)))
+            .map(|_| ())
+            .expect_err("NULL partition value must violate name_check");
+        assert_err_contains(err, "NULL");
+
+        // Satisfying partition values produce a write context; the data-column constraint is
+        // still enforced per batch on it.
+        let write_context = txn.partitioned_write_context(partition(Scalar::from("a")))?;
+        let err = engine
+            .write_parquet(&batch(vec![Some(-5)], vec!["a"])?, &write_context)
+            .await
+            .map(|_| ())
+            .expect_err("negative amount must still violate positive_amount");
+        assert_err_contains(err, "positive_amount");
+
+        let add_files_metadata = engine
+            .write_parquet(&batch(vec![Some(5)], vec!["a"])?, &write_context)
+            .await?;
+        txn.add_files(add_files_metadata);
+        txn.commit(&engine)?.unwrap_committed();
+
+        let expected = batch(vec![Some(5)], vec!["a"])?;
+        test_read(&expected, &table_url, Arc::new(engine))?;
         Ok(())
     }
 

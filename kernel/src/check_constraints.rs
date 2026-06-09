@@ -12,23 +12,29 @@
 //!   unaware of the feature cannot silently commit violating data.
 //! - `Transaction::check_constraints` (and `WriteContext::check_constraints`) expose each
 //!   constraint's raw SQL plus, when kernel can evaluate the expression, a kernel predicate.
-//! - [`CheckConstraintValidator`] binds the evaluable constraints to the engine's
-//!   [`EvaluationHandler`] once per write; its [`validate`](CheckConstraintValidator::validate)
-//!   then checks each batch, erroring with [`Error::CheckConstraintViolation`] on the first
-//!   violating row. The default engine validates automatically in `write_parquet`; custom engines
-//!   must validate (or enforce the raw SQL with their own evaluator) on every batch before writing.
-//!
-//! A constraint is *kernel-evaluable* only if kernel's constraint parser supports its
-//! expression (currently single column-vs-literal comparisons, e.g. `col1 < 10`) and it does
-//! not reference a partition column (partition values are per-file constants supplied via the
-//! write context, not columns of the data batch). Non-evaluable constraints are surfaced with
-//! [`CheckConstraint::is_kernel_evaluable`] returning false and fail validation closed.
+//! - Each constraint reports where it is enforced via [`CheckConstraint::enforcement`]:
+//!   - [`DataBatches`](CheckConstraintEnforcement::DataBatches): a [`CheckConstraintValidator`]
+//!     binds the constraint to the engine's [`EvaluationHandler`] once per write and checks every
+//!     batch, erroring with [`Error::CheckConstraintViolation`] on the first violating row. The
+//!     default engine validates automatically in `write_parquet`; custom engines must validate (or
+//!     enforce the raw SQL with their own evaluator) on every batch before writing.
+//!   - [`PartitionValues`](CheckConstraintEnforcement::PartitionValues): kernel itself evaluates
+//!     the constraint -- no engine needed -- against the partition values supplied to
+//!     `Transaction::partitioned_write_context`, rejecting the write context on violation. Readers
+//!     reconstruct partition columns from `add.partitionValues` rather than from file data, which
+//!     makes the write context's partition values the protocol-correct enforcement point for such
+//!     constraints.
+//!   - [`Connector`](CheckConstraintEnforcement::Connector): the expression is outside the subset
+//!     kernel's constraint parser supports (currently single column-vs-literal comparisons, e.g.
+//!     `col1 < 10`); the connector must enforce the raw SQL itself, and kernel-driven validation
+//!     fails closed.
 
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
-use crate::expressions::parse_sql_simple_predicate;
+use crate::expressions::{parse_sql_simple_predicate, Scalar};
+use crate::kernel_predicates::{DefaultKernelPredicateEvaluator, KernelPredicateEvaluator as _};
 use crate::schema::{column_name, ColumnName, ColumnNamesAndTypes, DataType, SchemaRef};
 use crate::utils::require;
 use crate::{DeltaResult, EngineData, Error, EvaluationHandler, PredicateEvaluator, PredicateRef};
@@ -45,8 +51,8 @@ pub(crate) fn has_check_constraints(configuration: &HashMap<String, String>) -> 
 
 /// Extracts all CHECK constraints from the table configuration, attempting to parse each one
 /// against `schema`. Constraints kernel cannot evaluate are still returned (with
-/// [`CheckConstraint::is_kernel_evaluable`] false) so that connectors with their own SQL engine
-/// can enforce them from the raw SQL.
+/// [`CheckConstraint::enforcement`] reporting [`CheckConstraintEnforcement::Connector`]) so that
+/// connectors with their own SQL engine can enforce them from the raw SQL.
 pub(crate) fn constraints_from_configuration(
     configuration: &HashMap<String, String>,
     schema: SchemaRef,
@@ -69,17 +75,73 @@ pub(crate) fn constraints_from_configuration(
     constraints
 }
 
-/// Whether (and how) kernel can evaluate a constraint's expression.
+/// Validates the (normalized, schema-cased) logical partition values of a write context against
+/// every partition-value-enforced constraint. Kernel evaluates these directly -- partition
+/// values are per-file constants, so no engine is needed. Constraints with other enforcement
+/// kinds are skipped (data-batch constraints are validated per batch; connector-enforced
+/// constraints fail closed when a validator is built).
+pub(crate) fn enforce_on_partition_values(
+    constraints: &[CheckConstraint],
+    partition_values: &HashMap<String, Scalar>,
+) -> DeltaResult<()> {
+    let resolver: HashMap<ColumnName, Scalar> = partition_values
+        .iter()
+        .map(|(name, value)| (ColumnName::new([name]), value.clone()))
+        .collect();
+    let evaluator = DefaultKernelPredicateEvaluator::from(resolver);
+    for constraint in constraints {
+        let ConstraintSupport::PartitionValues { predicate, .. } = &constraint.support else {
+            continue;
+        };
+        let result = evaluator.eval(predicate);
+        if result != Some(true) {
+            return Err(Error::CheckConstraintViolation {
+                name: constraint.name.clone(),
+                expression: constraint.raw_sql.clone(),
+                details: format!(
+                    "the write context's partition values evaluated to {}",
+                    match result {
+                        Some(_) => "false",
+                        None => "NULL",
+                    },
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Where a CHECK constraint is enforced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckConstraintEnforcement {
+    /// Kernel evaluates the constraint against every data batch, via a
+    /// [`CheckConstraintValidator`] (the default engine does this automatically in
+    /// `write_parquet`).
+    DataBatches,
+    /// The constraint references a partition column, so kernel evaluates it against the
+    /// partition values of each partitioned write context (partition values are per-file
+    /// constants, and readers reconstruct partition columns from `add.partitionValues`).
+    /// Connectors that do not create kernel write contexts must enforce the constraint against
+    /// their own partition values.
+    PartitionValues,
+    /// Kernel cannot evaluate the constraint; the connector must enforce the raw SQL with its
+    /// own SQL engine or fail the write.
+    Connector,
+}
+
+/// Whether (and where) kernel can evaluate a constraint's expression.
 #[derive(Debug, Clone)]
 enum ConstraintSupport {
-    /// Kernel parsed the expression and can evaluate it against data batches.
-    Evaluable(PredicateRef),
+    /// Kernel parsed the expression and evaluates it against data batches.
+    DataBatches(PredicateRef),
+    /// The expression references the named partition column; kernel evaluates it against the
+    /// partition values of each partitioned write context.
+    PartitionValues {
+        predicate: PredicateRef,
+        column: String,
+    },
     /// The expression is outside the subset kernel's constraint parser supports.
-    UnsupportedExpression,
-    /// The expression references the named partition column. Partition values are per-file
-    /// constants supplied via the write context rather than columns of the data batch, so
-    /// kernel does not evaluate such constraints against batches.
-    ReferencesPartitionColumn(String),
+    Unsupported,
 }
 
 /// One CHECK constraint: its name, the raw SQL stored under `delta.constraints.<name>`, and the
@@ -103,7 +165,7 @@ impl CheckConstraint {
     ) -> Self {
         let raw_sql = raw_sql.into();
         let support = match parse_sql_simple_predicate(&raw_sql, &schema) {
-            Err(_) => ConstraintSupport::UnsupportedExpression,
+            Err(_) => ConstraintSupport::Unsupported,
             Ok(predicate) => {
                 // The lowered predicate uses canonical (schema-cased) column names, and metadata
                 // partition columns are schema-cased too; compare case-insensitively anyway to be
@@ -115,9 +177,10 @@ impl CheckConstraint {
                         .find(|pc| pc.eq_ignore_ascii_case(top_level))
                         .cloned()
                 });
+                let predicate = Arc::new(predicate);
                 match partition_ref {
-                    Some(column) => ConstraintSupport::ReferencesPartitionColumn(column),
-                    None => ConstraintSupport::Evaluable(Arc::new(predicate)),
+                    Some(column) => ConstraintSupport::PartitionValues { predicate, column },
+                    None => ConstraintSupport::DataBatches(predicate),
                 }
             }
         };
@@ -139,19 +202,25 @@ impl CheckConstraint {
         &self.raw_sql
     }
 
-    /// True if kernel can evaluate this constraint, making it usable with
-    /// [`CheckConstraintValidator`]. When false -- the expression is outside the subset kernel's
-    /// parser supports, or it references a partition column -- the connector must enforce
-    /// [`Self::raw_sql`] with its own SQL engine or fail the write.
-    pub fn is_kernel_evaluable(&self) -> bool {
-        matches!(self.support, ConstraintSupport::Evaluable(_))
+    /// Where this constraint is enforced; see [`CheckConstraintEnforcement`].
+    pub fn enforcement(&self) -> CheckConstraintEnforcement {
+        match &self.support {
+            ConstraintSupport::DataBatches(_) => CheckConstraintEnforcement::DataBatches,
+            ConstraintSupport::PartitionValues { .. } => {
+                CheckConstraintEnforcement::PartitionValues
+            }
+            ConstraintSupport::Unsupported => CheckConstraintEnforcement::Connector,
+        }
     }
 
-    /// The parsed kernel predicate, when [`Self::is_kernel_evaluable`] is true.
+    /// The parsed kernel predicate, when kernel could parse the expression (the
+    /// [`DataBatches`](CheckConstraintEnforcement::DataBatches) and
+    /// [`PartitionValues`](CheckConstraintEnforcement::PartitionValues) enforcement kinds).
     pub fn predicate(&self) -> Option<&PredicateRef> {
         match &self.support {
-            ConstraintSupport::Evaluable(predicate) => Some(predicate),
-            _ => None,
+            ConstraintSupport::DataBatches(predicate) => Some(predicate),
+            ConstraintSupport::PartitionValues { predicate, .. } => Some(predicate),
+            ConstraintSupport::Unsupported => None,
         }
     }
 
@@ -161,7 +230,9 @@ impl CheckConstraint {
     ///
     /// # Errors
     ///
-    /// - The constraint is not kernel-evaluable (fails closed; see [`Self::is_kernel_evaluable`]).
+    /// - The constraint is not batch-enforced: partition-value-enforced constraints are checked
+    ///   when creating a partitioned write context, not against batches, and connector-enforced
+    ///   constraints fail closed (see [`Self::enforcement`]).
     /// - [`Error::CheckConstraintViolation`] if any row evaluates to `false` or `NULL` (the
     ///   protocol counts both as violations).
     /// - The engine fails to evaluate the predicate.
@@ -170,29 +241,25 @@ impl CheckConstraint {
         batch: &dyn EngineData,
         evaluation_handler: &dyn EvaluationHandler,
     ) -> DeltaResult<()> {
+        if let ConstraintSupport::PartitionValues { column, .. } = &self.support {
+            return Err(Error::unsupported(format!(
+                "CHECK constraint '{}' ({}) references partition column '{}' and is enforced \
+                 against partition values when creating a partitioned write context, not against \
+                 data batches",
+                self.name, self.raw_sql, column
+            )));
+        }
         CheckConstraintValidator::try_new(std::slice::from_ref(self), evaluation_handler)?
             .validate(batch)
     }
 
-    /// The fail-closed error explaining why kernel cannot evaluate this constraint.
-    fn not_evaluable_error(&self) -> Error {
-        match &self.support {
-            ConstraintSupport::Evaluable(_) => Error::internal_error(format!(
-                "CHECK constraint '{}' is evaluable; no error to report",
-                self.name
-            )),
-            ConstraintSupport::UnsupportedExpression => Error::unsupported(format!(
-                "CHECK constraint '{}' ({}) is outside the subset kernel can evaluate; the \
-                 connector must enforce it with its own SQL engine before writing",
-                self.name, self.raw_sql
-            )),
-            ConstraintSupport::ReferencesPartitionColumn(column) => Error::unsupported(format!(
-                "CHECK constraint '{}' ({}) references partition column '{}'; kernel does not \
-                 evaluate constraints over partition values, so the connector must enforce it \
-                 before writing",
-                self.name, self.raw_sql, column
-            )),
-        }
+    /// The fail-closed error for constraints kernel cannot evaluate at all.
+    fn connector_enforced_error(&self) -> Error {
+        Error::unsupported(format!(
+            "CHECK constraint '{}' ({}) is outside the subset kernel can evaluate; the \
+             connector must enforce it with its own SQL engine before writing",
+            self.name, self.raw_sql
+        ))
     }
 }
 
@@ -203,10 +270,14 @@ struct BoundConstraint {
     evaluator: Arc<dyn PredicateEvaluator>,
 }
 
-/// The table's CHECK constraints bound to an engine's [`EvaluationHandler`], ready to validate
-/// data batches. Build it once per write and reuse it for every batch: construction surfaces
-/// non-evaluable constraints immediately (fail closed, before any data is written) and amortizes
-/// predicate-evaluator creation across batches.
+/// The table's data-batch-enforced CHECK constraints bound to an engine's [`EvaluationHandler`],
+/// ready to validate batches. Build it once per write and reuse it for every batch: construction
+/// surfaces connector-enforced constraints immediately (fail closed, before any data is written)
+/// and amortizes predicate-evaluator creation across batches.
+///
+/// Partition-value-enforced constraints are skipped here: kernel enforces them when creating
+/// each partitioned write context. Connectors that do not create kernel write contexts must
+/// enforce them against their own partition values.
 ///
 /// Custom engines obtain one from `WriteContext::check_constraint_validator`, or directly from
 /// the constraints returned by `Transaction::check_constraints`.
@@ -216,24 +287,27 @@ pub struct CheckConstraintValidator {
 
 impl CheckConstraintValidator {
     /// Binds `constraints` to `evaluation_handler`, erroring (fail closed) if any constraint is
-    /// not kernel-evaluable. A connector that enforces non-evaluable constraints with its own
-    /// SQL engine should filter them out and bind only the kernel-evaluable remainder.
+    /// connector-enforced. A connector that enforces such constraints with its own SQL engine
+    /// should filter them out and bind only the remainder.
     pub fn try_new(
         constraints: &[CheckConstraint],
         evaluation_handler: &dyn EvaluationHandler,
     ) -> DeltaResult<Self> {
         let bound = constraints
             .iter()
-            .map(|constraint| {
-                let ConstraintSupport::Evaluable(predicate) = &constraint.support else {
-                    return Err(constraint.not_evaluable_error());
-                };
-                Ok(BoundConstraint {
-                    name: constraint.name.clone(),
-                    raw_sql: constraint.raw_sql.clone(),
-                    evaluator: evaluation_handler
-                        .new_predicate_evaluator(constraint.schema.clone(), predicate.clone())?,
-                })
+            .filter_map(|constraint| match &constraint.support {
+                ConstraintSupport::DataBatches(predicate) => Some(
+                    evaluation_handler
+                        .new_predicate_evaluator(constraint.schema.clone(), predicate.clone())
+                        .map(|evaluator| BoundConstraint {
+                            name: constraint.name.clone(),
+                            raw_sql: constraint.raw_sql.clone(),
+                            evaluator,
+                        }),
+                ),
+                // Enforced against the write context's partition values, not data batches.
+                ConstraintSupport::PartitionValues { .. } => None,
+                ConstraintSupport::Unsupported => Some(Err(constraint.connector_enforced_error())),
             })
             .collect::<DeltaResult<_>>()?;
         Ok(Self { bound })
@@ -347,12 +421,14 @@ mod tests {
         let constraints = constraints_from_configuration(&config, schema(), &[]);
         let names: Vec<_> = constraints.iter().map(|c| c.name()).collect();
         assert_eq!(names, ["a_check", "b_check"]);
-        assert!(constraints.iter().all(|c| c.is_kernel_evaluable()));
+        assert!(constraints
+            .iter()
+            .all(|c| c.enforcement() == CheckConstraintEnforcement::DataBatches));
         assert_eq!(constraints[0].raw_sql(), "amount > 0");
     }
 
     #[test]
-    fn junctions_unknown_columns_and_functions_are_not_evaluable() {
+    fn junctions_unknown_columns_and_functions_are_connector_enforced() {
         for sql in [
             "amount > 0 AND amount < 100", // junctions unsupported in the simple subset
             "nope > 0",                    // unknown column
@@ -360,29 +436,68 @@ mod tests {
             "amount IS NOT NULL",          // null checks unsupported in the simple subset
         ] {
             let constraint = CheckConstraint::new("c", sql, schema(), &[]);
-            assert!(
-                !constraint.is_kernel_evaluable(),
-                "expected '{sql}' to be non-evaluable"
+            assert_eq!(
+                constraint.enforcement(),
+                CheckConstraintEnforcement::Connector,
+                "expected '{sql}' to be connector-enforced"
             );
+            assert!(constraint.predicate().is_none());
             assert_eq!(constraint.raw_sql(), sql, "raw sql must round-trip");
         }
     }
 
     #[test]
-    fn partition_column_constraints_are_not_evaluable() {
+    fn partition_column_constraints_are_partition_value_enforced() {
         let partition_columns = vec!["name".to_string()];
-        // References the partition column (even with different casing): not evaluable.
+        // References the partition column (even with different casing).
         let on_partition = CheckConstraint::new("part", "NAME = 'a'", schema(), &partition_columns);
-        assert!(!on_partition.is_kernel_evaluable());
-        assert!(on_partition.predicate().is_none());
-        let err = on_partition.not_evaluable_error().to_string();
-        assert!(
-            err.contains("partition column 'name'"),
-            "error must name the partition column: {err}"
+        assert_eq!(
+            on_partition.enforcement(),
+            CheckConstraintEnforcement::PartitionValues
         );
+        assert!(on_partition.predicate().is_some());
 
-        // A data-column constraint on the same partitioned table stays evaluable.
+        // A data-column constraint on the same partitioned table stays batch-enforced.
         let on_data = CheckConstraint::new("data", "amount > 0", schema(), &partition_columns);
-        assert!(on_data.is_kernel_evaluable());
+        assert_eq!(
+            on_data.enforcement(),
+            CheckConstraintEnforcement::DataBatches
+        );
+    }
+
+    #[test]
+    fn enforce_on_partition_values_requires_true() {
+        let partition_columns = vec!["name".to_string()];
+        let constraints = constraints_from_configuration(
+            &config(&[
+                ("delta.constraints.name_check", "name = 'a'"),
+                ("delta.constraints.positive_amount", "amount > 0"),
+            ]),
+            schema(),
+            &partition_columns,
+        );
+        let values = |name: Scalar| HashMap::from([("name".to_string(), name)]);
+
+        // Satisfying partition values pass; the data-batch constraint is skipped even though
+        // `amount` is not a partition value.
+        enforce_on_partition_values(&constraints, &values(Scalar::from("a"))).unwrap();
+
+        // A false result is a violation.
+        let err = enforce_on_partition_values(&constraints, &values(Scalar::from("b")))
+            .expect_err("non-matching partition value must violate");
+        let Error::CheckConstraintViolation { name, details, .. } = err else {
+            panic!("expected CheckConstraintViolation, got: {err:?}");
+        };
+        assert_eq!(name, "name_check");
+        assert!(details.contains("false"), "details report false: {details}");
+
+        // A NULL partition value is also a violation (only `true` passes).
+        let err =
+            enforce_on_partition_values(&constraints, &values(Scalar::Null(DataType::STRING)))
+                .expect_err("NULL partition value must violate");
+        let Error::CheckConstraintViolation { details, .. } = err else {
+            panic!("expected CheckConstraintViolation, got: {err:?}");
+        };
+        assert!(details.contains("NULL"), "details report NULL: {details}");
     }
 }

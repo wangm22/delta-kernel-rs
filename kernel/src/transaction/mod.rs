@@ -1036,6 +1036,16 @@ impl<S: SupportsDataFiles> Transaction<S> {
             partition_values,
         )?;
 
+        // Enforce partition-column CHECK constraints against this write context's partition
+        // values. Partition values are per-file constants (readers reconstruct partition columns
+        // from add.partitionValues), so this is the protocol-correct enforcement point -- and it
+        // needs no engine: kernel evaluates the predicates over the scalars directly.
+        #[cfg(feature = "check-constraints-in-dev")]
+        crate::check_constraints::enforce_on_partition_values(
+            &shared.check_constraints,
+            &normalized,
+        )?;
+
         // Serialize values and translate keys from logical to physical names.
         let mut serialized = HashMap::with_capacity(normalized.len());
         for logical_name in &shared.logical_partition_columns {
