@@ -259,6 +259,10 @@ pub struct Transaction<S = ExistingTable> {
     data_change: bool,
     // Whether this transaction should be marked as a blind append.
     is_blind_append: bool,
+    // Whether the connector has acknowledged (via with_check_constraints) that it understands
+    // and enforces this table's CHECK constraints on every batch it writes.
+    #[cfg(feature = "check-constraints-in-dev")]
+    check_constraints_acknowledged: bool,
     // Files matched by update_deletion_vectors() with new DV descriptors appended. These are used
     // to generate remove/add action pairs during commit, ensuring file statistics are preserved.
     dv_matched_files: Vec<FilteredEngineData>,
@@ -373,6 +377,8 @@ impl<S> Transaction<S> {
 
         self.validate_blind_append_semantics()?;
         self.ensure_schema_non_empty_for_data_writes()?;
+        #[cfg(feature = "check-constraints-in-dev")]
+        self.ensure_check_constraints_acknowledged()?;
 
         // CDF check only applies to existing tables (not create table)
         // If there are add and remove files with data change in the same transaction, we block it.
@@ -538,6 +544,54 @@ impl<S> Transaction<S> {
     pub fn with_engine_info(mut self, engine_info: impl Into<String>) -> Self {
         self.engine_info = Some(engine_info.into());
         self
+    }
+
+    /// Acknowledge that this connector understands CHECK constraints: it must ensure every batch
+    /// it writes satisfies the table's constraints (see [`Self::check_constraints`]) before
+    /// adding the resulting files. Writes to a table with CHECK constraints fail without this
+    /// acknowledgment, so that connectors unaware of the feature cannot silently commit
+    /// violating data.
+    #[cfg(feature = "check-constraints-in-dev")]
+    pub fn with_check_constraints(mut self) -> Self {
+        self.check_constraints_acknowledged = true;
+        self
+    }
+
+    /// The table's CHECK constraints, each parsed against the logical schema when kernel
+    /// supports the expression. Returns an empty vector for tables without constraints.
+    ///
+    /// Connectors using the default engine get per-batch enforcement automatically in
+    /// `write_parquet`. Custom engines must enforce each constraint themselves -- via
+    /// [`CheckConstraint::validate`] when kernel parsed it, or with their own SQL engine from
+    /// [`CheckConstraint::raw_sql`] otherwise.
+    ///
+    /// [`CheckConstraint::validate`]: crate::check_constraints::CheckConstraint::validate
+    /// [`CheckConstraint::raw_sql`]: crate::check_constraints::CheckConstraint::raw_sql
+    #[cfg(feature = "check-constraints-in-dev")]
+    pub fn check_constraints(&self) -> Vec<crate::check_constraints::CheckConstraint> {
+        let table_config = &self.effective_table_config;
+        crate::check_constraints::constraints_from_configuration(
+            table_config.metadata().configuration(),
+            table_config.logical_schema(),
+        )
+    }
+
+    /// Fails writes to tables with CHECK constraints unless the connector called
+    /// [`Self::with_check_constraints`].
+    #[cfg(feature = "check-constraints-in-dev")]
+    fn ensure_check_constraints_acknowledged(&self) -> DeltaResult<()> {
+        if !self.check_constraints_acknowledged
+            && crate::check_constraints::has_check_constraints(
+                self.effective_table_config.metadata().configuration(),
+            )
+        {
+            return Err(Error::unsupported(
+                "table has CHECK constraints (delta.constraints.*); the connector must enforce \
+                 them on every batch it writes and acknowledge this by calling \
+                 Transaction::with_check_constraints()",
+            ));
+        }
+        Ok(())
     }
 
     /// Set the content of the commitInfo action for this transaction. Note that kernel will
@@ -914,6 +968,11 @@ impl<S: SupportsDataFiles> Transaction<S> {
                 logical_partition_columns: table_config.partition_columns().to_vec(),
                 randomize_file_prefixes,
                 random_prefix_length,
+                #[cfg(feature = "check-constraints-in-dev")]
+                check_constraints: crate::check_constraints::constraints_from_configuration(
+                    table_config.metadata().configuration(),
+                    table_config.logical_schema(),
+                ),
             })
         })
     }
@@ -959,6 +1018,8 @@ impl<S: SupportsDataFiles> Transaction<S> {
         partition_values: HashMap<String, Scalar>,
     ) -> DeltaResult<WriteContext> {
         self.ensure_schema_non_empty_for_write_context()?;
+        #[cfg(feature = "check-constraints-in-dev")]
+        self.ensure_check_constraints_acknowledged()?;
         let shared = self.shared_write_state();
         require!(
             !shared.logical_partition_columns.is_empty(),
@@ -1007,6 +1068,8 @@ impl<S: SupportsDataFiles> Transaction<S> {
     /// [`partitioned_write_context`](Self::partitioned_write_context) instead).
     pub fn unpartitioned_write_context(&self) -> DeltaResult<WriteContext> {
         self.ensure_schema_non_empty_for_write_context()?;
+        #[cfg(feature = "check-constraints-in-dev")]
+        self.ensure_check_constraints_acknowledged()?;
         let shared = self.shared_write_state();
         require!(
             shared.logical_partition_columns.is_empty(),

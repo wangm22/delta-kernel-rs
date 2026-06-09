@@ -58,6 +58,30 @@ pub(crate) fn parse_sql_predicate(sql: &str, schema: &StructType) -> DeltaResult
     lower::lower(&ast, schema)
 }
 
+/// Parse a CHECK-constraint SQL string restricted to a single comparison between a column and a
+/// literal (e.g. `col1 < 10`). This is the subset the check-constraints prototype enforces:
+/// junctions (`AND`/`OR`), `NOT`, `IS [NOT] NULL`, and bare boolean operands are rejected as
+/// unsupported even though [`parse_sql_predicate`] can parse them.
+///
+/// # Errors
+///
+/// Same as [`parse_sql_predicate`], plus an error for any predicate that is not a single
+/// comparison.
+#[cfg(feature = "check-constraints-in-dev")]
+pub(crate) fn parse_sql_simple_predicate(sql: &str, schema: &StructType) -> DeltaResult<Predicate> {
+    let tokens = token::tokenize(sql)?;
+    if tokens.is_empty() {
+        return Err(Error::generic("empty CHECK constraint expression"));
+    }
+    let ast = parser::parse(tokens)?;
+    match &ast {
+        parser::Ast::Compare(..) => lower::lower(&ast, schema),
+        _ => Err(Error::unsupported(
+            "only simple comparison CHECK constraints (e.g. `col1 < 10`) are supported",
+        )),
+    }
+}
+
 /// High-level syntactic shape of a SQL input. Adding a new SQL form means adding a variant here
 /// and an arm in [`parse_sql`].
 enum SqlForm<'a> {

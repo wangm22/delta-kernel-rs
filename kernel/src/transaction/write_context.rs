@@ -10,6 +10,8 @@ use crate::expressions::{ColumnName, ExpressionRef};
 use crate::partition::hive::{build_partition_path, uri_encode_path};
 use crate::schema::SchemaRef;
 use crate::table_features::ColumnMappingMode;
+#[cfg(feature = "check-constraints-in-dev")]
+use crate::{check_constraints::CheckConstraint, EngineData, EvaluationHandler};
 use crate::{DeltaResult, Error};
 
 /// Table-wide write state shared across all [`WriteContext`] instances created by a
@@ -35,6 +37,11 @@ pub(super) struct SharedWriteState {
     /// of the random prefix in [`WriteContext::write_dir`] for both the column mapping and
     /// `randomizeFilePrefixes` paths.
     pub(super) random_prefix_length: NonZero<usize>,
+    /// The table's CHECK constraints (parsed where kernel supports the expression). Every batch
+    /// must satisfy them before its files are added; see
+    /// [`WriteContext::validate_check_constraints`].
+    #[cfg(feature = "check-constraints-in-dev")]
+    pub(super) check_constraints: Vec<CheckConstraint>,
 }
 
 /// A write context for a specific partition or an unpartitioned table. Created by
@@ -199,6 +206,32 @@ impl WriteContext {
         &self.physical_partition_values
     }
 
+    /// The table's CHECK constraints. Custom engines must ensure every batch they write
+    /// satisfies these before adding the resulting files -- either via
+    /// [`Self::validate_check_constraints`], or with their own SQL engine for constraints
+    /// kernel could not parse.
+    #[cfg(feature = "check-constraints-in-dev")]
+    pub fn check_constraints(&self) -> &[CheckConstraint] {
+        &self.shared.check_constraints
+    }
+
+    /// Validates `batch` (logical data, matching [`Self::logical_schema`]) against every CHECK
+    /// constraint on the table, erroring on the first violation and failing closed on
+    /// constraints kernel could not parse. The default engine's `write_parquet` calls this
+    /// automatically; custom engines should call it (or otherwise enforce each constraint)
+    /// on every batch before writing.
+    #[cfg(feature = "check-constraints-in-dev")]
+    pub fn validate_check_constraints(
+        &self,
+        batch: &dyn EngineData,
+        evaluation_handler: &dyn EvaluationHandler,
+    ) -> DeltaResult<()> {
+        self.shared
+            .check_constraints
+            .iter()
+            .try_for_each(|constraint| constraint.validate(batch, evaluation_handler))
+    }
+
     /// Builds the Hive-style partition path suffix (e.g., `year=2024/region=US/`).
     /// Only called when column mapping is OFF.
     fn hive_partition_path_suffix(&self) -> String {
@@ -328,6 +361,8 @@ mod tests {
             randomize_file_prefixes,
             random_prefix_length: NonZero::new(random_prefix_length)
                 .expect("test prefix length must be > 0"),
+            #[cfg(feature = "check-constraints-in-dev")]
+            check_constraints: vec![],
         });
         WriteContext {
             shared,

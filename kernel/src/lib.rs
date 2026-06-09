@@ -87,6 +87,8 @@ use self::schema::{DataType, SchemaRef};
 
 mod action_reconciliation;
 pub mod actions;
+#[cfg(feature = "check-constraints-in-dev")]
+pub mod check_constraints;
 pub mod checkpoint;
 pub mod committer;
 #[cfg(feature = "internal-api")]

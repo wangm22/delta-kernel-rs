@@ -310,10 +310,15 @@ static INVARIANTS_INFO: FeatureInfo = FeatureInfo {
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
+// Check-constraints support is in development; kernel support is gated by the
+// `check-constraints-in-dev` cargo feature. Drop the gate once the feature fully ships.
 static CHECK_CONSTRAINTS_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::WriterOnly,
     min_legacy_version: Some(MinReaderWriterVersion::new(1, 3)),
     feature_requirements: &[],
+    #[cfg(feature = "check-constraints-in-dev")]
+    kernel_support: KernelSupport::Supported,
+    #[cfg(not(feature = "check-constraints-in-dev"))]
     kernel_support: KernelSupport::NotSupported,
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
