@@ -127,6 +127,11 @@ declarative-plans = ["arrow-conversion", "arrow-expression"]
 # work. TODO(#2630): remove once full column-defaults support ships.
 column-defaults-in-dev = []
 
+# Experimental, temporary, test-only feature flag guarding the in-progress check-constraints
+# work. Gates the SQL predicate parser (`parse_sql_predicate`) and, later, `checkConstraints`
+# write enforcement. Remove once full check-constraints support ships.
+check-constraints-in-dev = []
+
 # this is an 'internal' feature flag which has all the shared bits from default-engine-native-tls
 # and default-engine-rustls
 default-engine-base = [

@@ -14,9 +14,49 @@
 
 use std::borrow::Cow;
 
+#[cfg(feature = "check-constraints-in-dev")]
+use crate::expressions::Predicate;
 use crate::expressions::{Expression, Scalar};
+#[cfg(feature = "check-constraints-in-dev")]
+use crate::schema::StructType;
 use crate::schema::{DataType, PrimitiveType};
 use crate::{DeltaResult, Error};
+
+// === CHECK-constraint predicate parser (Stage 2) ===
+//
+// `parse_sql` (above) turns a single SQL *literal* of a known type into an `Expression`. CHECK
+// constraints are boolean *predicates* over columns (e.g. `amount > 0 AND name IS NOT NULL`), which
+// the shape-classifier cannot express. These submodules add the three layers it lacks -- a
+// tokenizer, a precedence parser, and a schema-aware lowering pass -- and reuse `parse_sql` to
+// parse the leaf literals.
+#[cfg(feature = "check-constraints-in-dev")]
+mod lower;
+#[cfg(feature = "check-constraints-in-dev")]
+mod parser;
+#[cfg(feature = "check-constraints-in-dev")]
+mod token;
+
+/// Parse a CHECK-constraint SQL string into a kernel [`Predicate`], resolving column references
+/// against `schema` and inferring each literal's type from the column it is compared against.
+///
+/// The supported grammar is column-vs-literal comparisons (`= <> != < > <= >=`), `AND`/`OR`/`NOT`,
+/// parentheses, and `IS [NOT] NULL`. Column names resolve case-insensitively (matching Delta/Spark
+/// and kernel's other column-resolution paths). Literal leaves are parsed by [`parse_sql`].
+///
+/// # Errors
+///
+/// Returns an error for any input outside the supported grammar (functions, arithmetic, `IN`,
+/// `BETWEEN`, ...), for unknown columns, and for type-incompatible literals. Callers treat that
+/// error as the signal that a constraint is *not kernel-parsable*.
+#[cfg(feature = "check-constraints-in-dev")]
+pub(crate) fn parse_sql_predicate(sql: &str, schema: &StructType) -> DeltaResult<Predicate> {
+    let tokens = token::tokenize(sql)?;
+    if tokens.is_empty() {
+        return Err(Error::generic("empty CHECK constraint expression"));
+    }
+    let ast = parser::parse(tokens)?;
+    lower::lower(&ast, schema)
+}
 
 /// High-level syntactic shape of a SQL input. Adding a new SQL form means adding a variant here
 /// and an arm in [`parse_sql`].
