@@ -148,15 +148,28 @@ mod enabled {
     }
 
     #[tokio::test]
-    async fn commit_requires_acknowledgment() -> Result<(), Box<dyn std::error::Error>> {
+    async fn commit_requires_acknowledgment_only_when_adding_data(
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let (table_url, engine) =
             setup_constrained_table("test_cc_gate_commit", &[("positive_amount", "amount > 0")])
                 .await?;
-        // Even a connector that skips kernel write contexts is stopped at commit.
-        let txn = begin_txn(&table_url, &engine)?;
+
+        // Constraints apply only to added rows: a commit with no add files (e.g. a
+        // metadata-only ALTER) needs no acknowledgment.
+        let txn = begin_txn(&table_url, &engine)?.with_operation("WRITE".to_string());
+        txn.commit(&engine)?.unwrap_committed();
+
+        // But a connector that bypasses kernel write contexts and registers add files
+        // directly is still stopped at commit.
+        let mut txn = begin_txn(&table_url, &engine)?.with_operation("WRITE".to_string());
+        let fabricated = test_utils::create_add_files_metadata(
+            txn.add_files_schema(),
+            vec![("part-00000.parquet", 1024, 1000000, Some(1))],
+        )?;
+        txn.add_files(fabricated);
         let err = txn
             .commit(&engine)
-            .expect_err("commit must require check-constraint acknowledgment");
+            .expect_err("commit with add files must require acknowledgment");
         assert_err_contains(err, "with_check_constraints");
         Ok(())
     }

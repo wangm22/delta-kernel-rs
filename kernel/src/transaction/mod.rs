@@ -377,8 +377,12 @@ impl<S> Transaction<S> {
 
         self.validate_blind_append_semantics()?;
         self.ensure_schema_non_empty_for_data_writes()?;
+        // Constraints apply only to rows being added, so metadata-only, remove-only, and
+        // set-transaction-only commits (e.g. ALTER TABLE) need no acknowledgment.
         #[cfg(feature = "check-constraints-in-dev")]
-        self.ensure_check_constraints_acknowledged()?;
+        if !self.add_files_metadata.is_empty() {
+            self.ensure_check_constraints_acknowledged()?;
+        }
 
         // CDF check only applies to existing tables (not create table)
         // If there are add and remove files with data change in the same transaction, we block it.
