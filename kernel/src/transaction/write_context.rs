@@ -12,7 +12,7 @@ use crate::schema::SchemaRef;
 use crate::table_features::ColumnMappingMode;
 #[cfg(feature = "check-constraints-in-dev")]
 use crate::{
-    check_constraints::{CheckConstraint, CheckConstraintValidator},
+    check_constraints::{CheckConstraintValidator, CheckConstraints},
     EngineData, EvaluationHandler,
 };
 use crate::{DeltaResult, Error};
@@ -44,7 +44,7 @@ pub(super) struct SharedWriteState {
     /// must satisfy them before its files are added; see
     /// [`WriteContext::validate_check_constraints`].
     #[cfg(feature = "check-constraints-in-dev")]
-    pub(super) check_constraints: Vec<CheckConstraint>,
+    pub(super) check_constraints: CheckConstraints,
 }
 
 /// A write context for a specific partition or an unpartitioned table. Created by
@@ -214,7 +214,7 @@ impl WriteContext {
     /// [`Self::validate_check_constraints`], or with their own SQL engine for constraints
     /// kernel could not parse.
     #[cfg(feature = "check-constraints-in-dev")]
-    pub fn check_constraints(&self) -> &[CheckConstraint] {
+    pub fn check_constraints(&self) -> &CheckConstraints {
         &self.shared.check_constraints
     }
 
@@ -228,7 +228,7 @@ impl WriteContext {
         &self,
         evaluation_handler: &dyn EvaluationHandler,
     ) -> DeltaResult<CheckConstraintValidator> {
-        CheckConstraintValidator::try_new(&self.shared.check_constraints, evaluation_handler)
+        self.shared.check_constraints.validator(evaluation_handler)
     }
 
     /// Validates `batch` (logical data, matching [`Self::logical_schema`]) against every CHECK
@@ -377,7 +377,7 @@ mod tests {
             random_prefix_length: NonZero::new(random_prefix_length)
                 .expect("test prefix length must be > 0"),
             #[cfg(feature = "check-constraints-in-dev")]
-            check_constraints: vec![],
+            check_constraints: CheckConstraints::default(),
         });
         WriteContext {
             shared,

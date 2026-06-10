@@ -74,7 +74,7 @@ pub(crate) fn constraints_from_configuration(
     configuration: &HashMap<String, String>,
     schema: SchemaRef,
     partition_columns: &[String],
-) -> Vec<CheckConstraint> {
+) -> CheckConstraints {
     let mut constraints: Vec<_> = configuration
         .iter()
         .filter_map(|(key, sql)| {
@@ -89,7 +89,60 @@ pub(crate) fn constraints_from_configuration(
         .collect();
     // HashMap iteration order is unstable; sort for deterministic discovery and error ordering.
     constraints.sort_by(|a, b| a.name.cmp(&b.name));
-    constraints
+    CheckConstraints(constraints)
+}
+
+/// All CHECK constraints on a table. Dereferences to a slice for per-constraint access.
+///
+/// The first question a connector asks is set-level, so it is answered here:
+/// [`is_kernel_parsable`](Self::is_kernel_parsable) reports whether kernel parsed *every*
+/// constraint. If it did, kernel enforces them all (per data batch or per partitioned write
+/// context) and the connector proceeds normally. If not, the connector must evaluate the
+/// remaining raw SQL itself -- [`connector_enforced`](Self::connector_enforced) yields exactly
+/// those constraints -- or fail the write.
+#[derive(Debug, Clone, Default)]
+pub struct CheckConstraints(Vec<CheckConstraint>);
+
+impl CheckConstraints {
+    /// True if kernel parsed every constraint, i.e. no constraint requires
+    /// [`Connector`](CheckConstraintEnforcement::Connector) enforcement. Kernel then enforces
+    /// all of them: data-batch constraints via [`CheckConstraintValidator`] (automatic in the
+    /// default engine's `write_parquet`) and partition-column constraints when each partitioned
+    /// write context is created.
+    pub fn is_kernel_parsable(&self) -> bool {
+        self.0
+            .iter()
+            .all(|c| c.enforcement() != CheckConstraintEnforcement::Connector)
+    }
+
+    /// The constraints kernel could not parse, whose [`raw_sql`](CheckConstraint::raw_sql) the
+    /// connector must evaluate itself before writing (or fail the write). Empty when
+    /// [`is_kernel_parsable`](Self::is_kernel_parsable) is true.
+    pub fn connector_enforced(&self) -> impl Iterator<Item = &CheckConstraint> {
+        self.0
+            .iter()
+            .filter(|c| c.enforcement() == CheckConstraintEnforcement::Connector)
+    }
+
+    /// Binds the data-batch-enforced constraints to `evaluation_handler` for per-batch
+    /// validation; equivalent to [`CheckConstraintValidator::try_new`]. Fails closed if any
+    /// constraint is connector-enforced -- check [`is_kernel_parsable`](Self::is_kernel_parsable)
+    /// first and handle the [`connector_enforced`](Self::connector_enforced) remainder to avoid
+    /// that error.
+    pub fn validator(
+        &self,
+        evaluation_handler: &dyn EvaluationHandler,
+    ) -> DeltaResult<CheckConstraintValidator> {
+        CheckConstraintValidator::try_new(&self.0, evaluation_handler)
+    }
+}
+
+impl std::ops::Deref for CheckConstraints {
+    type Target = [CheckConstraint];
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
 }
 
 /// Validates the (normalized, schema-cased) logical partition values of a write context against
@@ -602,6 +655,41 @@ mod tests {
             assert_eq!(constraints.len(), 1, "constraint under {key} discovered");
             assert_eq!(constraints[0].name(), "positive");
         }
+    }
+
+    #[test]
+    fn collection_answers_the_set_level_parsable_question() {
+        // All parsable (including a partition-column constraint, which kernel also enforces).
+        let all_parsable = constraints_from_configuration(
+            &config(&[
+                ("delta.constraints.positive", "amount > 0"),
+                ("delta.constraints.name_check", "name = 'a'"),
+            ]),
+            schema(),
+            &["name".to_string()],
+        );
+        assert!(all_parsable.is_kernel_parsable());
+        assert_eq!(all_parsable.connector_enforced().count(), 0);
+
+        // One constraint outside the supported grammar flips the set-level answer, and
+        // connector_enforced() exposes exactly that constraint's raw SQL.
+        let mixed = constraints_from_configuration(
+            &config(&[
+                ("delta.constraints.positive", "amount > 0"),
+                ("delta.constraints.range", "amount > 0 AND amount < 100"),
+            ]),
+            schema(),
+            &[],
+        );
+        assert!(!mixed.is_kernel_parsable());
+        let raw: Vec<_> = mixed
+            .connector_enforced()
+            .map(|c| (c.name(), c.raw_sql()))
+            .collect();
+        assert_eq!(raw, [("range", "amount > 0 AND amount < 100")]);
+
+        // No constraints: trivially parsable.
+        assert!(constraints_from_configuration(&config(&[]), schema(), &[]).is_kernel_parsable());
     }
 
     #[test]

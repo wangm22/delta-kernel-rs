@@ -558,17 +558,25 @@ impl<S> Transaction<S> {
     }
 
     /// The table's CHECK constraints, each parsed against the logical schema when kernel
-    /// supports the expression. Returns an empty vector for tables without constraints.
+    /// supports the expression. Returns an empty collection for tables without constraints.
     ///
-    /// Connectors using the default engine get per-batch enforcement automatically in
-    /// `write_parquet`. Custom engines must enforce each constraint themselves -- via
-    /// [`CheckConstraint::validate`] when kernel parsed it, or with their own SQL engine from
-    /// [`CheckConstraint::raw_sql`] otherwise.
+    /// Custom engines start with the set-level question and branch:
     ///
-    /// [`CheckConstraint::validate`]: crate::check_constraints::CheckConstraint::validate
-    /// [`CheckConstraint::raw_sql`]: crate::check_constraints::CheckConstraint::raw_sql
+    /// ```ignore
+    /// let constraints = txn.check_constraints();
+    /// if constraints.is_kernel_parsable() {
+    ///     // Kernel enforces everything: data-batch constraints per batch (automatic in the
+    ///     // default engine's write_parquet, or via constraints.validator(handler)), and
+    ///     // partition-column constraints when each partitioned write context is created.
+    /// } else {
+    ///     // Kernel cannot evaluate some constraints; evaluate their raw SQL yourself or fail.
+    ///     for constraint in constraints.connector_enforced() {
+    ///         my_sql_engine.enforce(constraint.raw_sql(), &batch)?;
+    ///     }
+    /// }
+    /// ```
     #[cfg(feature = "check-constraints-in-dev")]
-    pub fn check_constraints(&self) -> Vec<crate::check_constraints::CheckConstraint> {
+    pub fn check_constraints(&self) -> crate::check_constraints::CheckConstraints {
         let table_config = &self.effective_table_config;
         crate::check_constraints::constraints_from_configuration(
             table_config.metadata().configuration(),

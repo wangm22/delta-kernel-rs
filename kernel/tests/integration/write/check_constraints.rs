@@ -173,7 +173,10 @@ mod enabled {
         .await?;
         let txn = begin_txn(&table_url, &engine)?.with_check_constraints();
 
+        // Set-level question first: kernel can handle everything on this table.
         let constraints = txn.check_constraints();
+        assert!(constraints.is_kernel_parsable());
+
         let constraint = constraints
             .iter()
             .exactly_one()
@@ -253,17 +256,18 @@ mod enabled {
         .await?;
         let txn = begin_txn(&table_url, &engine)?.with_check_constraints();
 
-        // Discovery still exposes the raw SQL so strong connectors can self-enforce.
+        // The connector's first, set-level question: can kernel handle all the constraints?
         let constraints = txn.check_constraints();
-        let constraint = constraints
-            .iter()
-            .exactly_one()
-            .expect("table has exactly one constraint");
-        assert_eq!(
-            constraint.enforcement(),
-            CheckConstraintEnforcement::Connector
-        );
-        assert_eq!(constraint.raw_sql(), "amount > 0 AND amount < 100");
+        assert!(!constraints.is_kernel_parsable());
+
+        // No: connector_enforced() exposes the raw SQL for the connector to evaluate itself
+        // (a connector with no SQL engine must instead refuse to write).
+        let raw: Vec<_> = constraints.connector_enforced().collect();
+        let [raw] = raw[..] else {
+            panic!("table has exactly one connector-enforced constraint");
+        };
+        assert_eq!(raw.enforcement(), CheckConstraintEnforcement::Connector);
+        assert_eq!(raw.raw_sql(), "amount > 0 AND amount < 100");
 
         // The DefaultEngine path cannot evaluate it, so it must not write at all.
         let write_context = txn.unpartitioned_write_context()?;
