@@ -251,18 +251,40 @@ impl CheckConstraint {
         let support = match parse_sql_simple_predicate(&raw_sql, &schema) {
             Err(reason) => ConstraintSupport::Unsupported(reason.to_string()),
             Ok(predicate) => {
-                // The lowered predicate uses canonical (schema-cased) column names, and metadata
-                // partition columns are schema-cased too; compare case-insensitively anyway to be
-                // robust against non-canonical metadata.
-                let partition_ref = predicate.references().into_iter().find_map(|column| {
-                    let top_level = column.path().first()?;
+                // Classify by which columns the predicate references. The lowered predicate uses
+                // canonical (schema-cased) column names, and metadata partition columns are
+                // schema-cased too; compare case-insensitively anyway to be robust against
+                // non-canonical metadata.
+                let references = predicate.references();
+                let is_partition = |column: &ColumnName| {
+                    column.path().first().is_some_and(|top_level| {
+                        partition_columns
+                            .iter()
+                            .any(|pc| pc.eq_ignore_ascii_case(top_level))
+                    })
+                };
+                let partition_column = references.iter().find(|c| is_partition(c)).map(|column| {
+                    // Render with the metadata-cased partition column name.
+                    let top_level = &column.path()[0];
                     partition_columns
                         .iter()
                         .find(|pc| pc.eq_ignore_ascii_case(top_level))
                         .cloned()
+                        .unwrap_or_else(|| top_level.clone())
                 });
+                let references_data_column = references.iter().any(|c| !is_partition(c));
                 let predicate = Arc::new(predicate);
-                match partition_ref {
+                match partition_column {
+                    // A single constraint that references both a partition column and a data
+                    // column can be evaluated against partition values OR data batches, but not a
+                    // mix -- neither enforcement path sees all the columns. Rather than enforce it
+                    // half-correctly, mark it connector-enforced so kernel-evaluating engines fail
+                    // closed (engines with their own evaluator can still enforce the raw SQL).
+                    Some(_) if references_data_column => ConstraintSupport::Unsupported(
+                        "constraint references both partition and data columns, which kernel \
+                         cannot evaluate against a single source"
+                            .to_string(),
+                    ),
                     Some(column) => ConstraintSupport::PartitionValues { predicate, column },
                     None => ConstraintSupport::DataBatches(predicate),
                 }
@@ -773,6 +795,21 @@ mod tests {
             on_data.enforcement(),
             CheckConstraintEnforcement::DataBatches
         );
+    }
+
+    #[test]
+    fn constraint_mixing_partition_and_data_columns_is_connector_enforced() {
+        let partition_columns = vec!["name".to_string()];
+        // References both the partition column (`name`) and a data column (`amount`). Neither the
+        // partition-values path nor the data-batch path sees all columns, so kernel cannot
+        // evaluate it against a single source -- it is reported connector-enforced (fail closed).
+        let mixed =
+            CheckConstraint::new("mixed", "name = 'a' AND amount > 0", schema(), &partition_columns);
+        // Connector-enforced: kernel cannot evaluate it against a single source.
+        assert_eq!(mixed.enforcement(), CheckConstraintEnforcement::Connector);
+        assert!(mixed.predicate().is_none());
+        // The raw SQL stays exposed so a strong connector can still enforce it.
+        assert_eq!(mixed.raw_sql(), "name = 'a' AND amount > 0");
     }
 
     #[test]
