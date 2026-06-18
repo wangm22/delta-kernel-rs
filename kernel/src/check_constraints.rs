@@ -7,9 +7,10 @@
 //! `false` and `NULL` are violations). Kernel never sees row data on the write path, so
 //! enforcement is a cooperative contract between kernel and the connector:
 //!
-//! - A connector acknowledges the contract by calling `Transaction::with_check_constraints`;
-//!   without the acknowledgment, kernel fails writes to constrained tables so that connectors
-//!   unaware of the feature cannot silently commit violating data.
+//! - A connector acknowledges the contract by calling `Transaction::check_constraints` -- the act
+//!   of reading the table's constraints is the acknowledgment. Without it, kernel fails data-adding
+//!   commits to constrained tables so that connectors unaware of the feature cannot silently commit
+//!   violating data.
 //! - `Transaction::check_constraints` (and `WriteContext::check_constraints`) expose each
 //!   constraint's raw SQL plus, when kernel can evaluate the expression, a kernel predicate.
 //! - Each constraint reports where it is enforced via [`CheckConstraint::enforcement`]:
@@ -803,8 +804,12 @@ mod tests {
         // References both the partition column (`name`) and a data column (`amount`). Neither the
         // partition-values path nor the data-batch path sees all columns, so kernel cannot
         // evaluate it against a single source -- it is reported connector-enforced (fail closed).
-        let mixed =
-            CheckConstraint::new("mixed", "name = 'a' AND amount > 0", schema(), &partition_columns);
+        let mixed = CheckConstraint::new(
+            "mixed",
+            "name = 'a' AND amount > 0",
+            schema(),
+            &partition_columns,
+        );
         // Connector-enforced: kernel cannot evaluate it against a single source.
         assert_eq!(mixed.enforcement(), CheckConstraintEnforcement::Connector);
         assert!(mixed.predicate().is_none());

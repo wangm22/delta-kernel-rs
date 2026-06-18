@@ -95,7 +95,7 @@ impl Transaction {
             engine_commit_info: None,
             is_blind_append: false,
             #[cfg(feature = "check-constraints-in-dev")]
-            check_constraints_acknowledged: false,
+            check_constraints_acknowledged: std::sync::atomic::AtomicBool::new(false),
             dv_matched_files: vec![],
             physical_clustering_columns: clustering_columns,
             shared_write_state: OnceLock::new(),

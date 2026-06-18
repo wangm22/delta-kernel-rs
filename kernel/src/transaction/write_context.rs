@@ -209,10 +209,12 @@ impl WriteContext {
         &self.physical_partition_values
     }
 
-    /// The table's CHECK constraints. Custom engines must ensure every batch they write
+    /// The table's CHECK constraints (a convenience accessor; the same constraints are returned by
+    /// `Transaction::check_constraints`). Custom engines must ensure every batch they write
     /// satisfies these before adding the resulting files -- either via
-    /// [`Self::validate_check_constraints`], or with their own SQL engine for constraints
-    /// kernel could not parse.
+    /// [`Self::validate_check_constraints`], or with their own SQL engine for constraints kernel
+    /// could not parse. Note: calling this does not satisfy the acknowledgment gate; calling
+    /// `Transaction::check_constraints` does.
     #[cfg(feature = "check-constraints-in-dev")]
     pub fn check_constraints(&self) -> &CheckConstraints {
         &self.shared.check_constraints

@@ -70,7 +70,7 @@ impl AlterTableTransaction {
             // now: safe, but misses the true-case optimization delta-spark applies.
             is_blind_append: false,
             #[cfg(feature = "check-constraints-in-dev")]
-            check_constraints_acknowledged: false,
+            check_constraints_acknowledged: std::sync::atomic::AtomicBool::new(false),
             dv_matched_files: vec![],
             physical_clustering_columns: None,
             _state: PhantomData,

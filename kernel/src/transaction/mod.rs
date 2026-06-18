@@ -2,6 +2,8 @@ use std::collections::{HashMap, HashSet};
 use std::iter;
 use std::marker::PhantomData;
 use std::ops::Deref;
+#[cfg(feature = "check-constraints-in-dev")]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, OnceLock};
 
 use delta_kernel_derive::internal_api;
@@ -259,10 +261,11 @@ pub struct Transaction<S = ExistingTable> {
     data_change: bool,
     // Whether this transaction should be marked as a blind append.
     is_blind_append: bool,
-    // Whether the connector has acknowledged (via with_check_constraints) that it understands
-    // and enforces this table's CHECK constraints on every batch it writes.
+    // Whether the connector has acknowledged that it understands and enforces this table's CHECK
+    // constraints, recorded when `Transaction::check_constraints` is called. Interior-mutable
+    // (`AtomicBool`) because acknowledgment flows through a `&self` accessor; read at commit time.
     #[cfg(feature = "check-constraints-in-dev")]
-    check_constraints_acknowledged: bool,
+    check_constraints_acknowledged: AtomicBool,
     // Files matched by update_deletion_vectors() with new DV descriptors appended. These are used
     // to generate remove/add action pairs during commit, ensuring file statistics are preserved.
     dv_matched_files: Vec<FilteredEngineData>,
@@ -550,19 +553,13 @@ impl<S> Transaction<S> {
         self
     }
 
-    /// Acknowledge that this connector understands CHECK constraints: it must ensure every batch
-    /// it writes satisfies the table's constraints (see [`Self::check_constraints`]) before
-    /// adding the resulting files. Writes to a table with CHECK constraints fail without this
-    /// acknowledgment, so that connectors unaware of the feature cannot silently commit
-    /// violating data.
-    #[cfg(feature = "check-constraints-in-dev")]
-    pub fn with_check_constraints(mut self) -> Self {
-        self.check_constraints_acknowledged = true;
-        self
-    }
-
     /// The table's CHECK constraints, each parsed against the logical schema when kernel
     /// supports the expression. Returns an empty collection for tables without constraints.
+    ///
+    /// **Calling this method is the connector's acknowledgment that it understands and will
+    /// enforce the table's CHECK constraints.** A data-adding commit to a table that has CHECK
+    /// constraints fails unless this method was called (see [`Self::commit`]); this is how kernel
+    /// keeps a connector unaware of the feature from silently committing violating data.
     ///
     /// Custom engines start with the set-level question and branch:
     ///
@@ -581,6 +578,10 @@ impl<S> Transaction<S> {
     /// ```
     #[cfg(feature = "check-constraints-in-dev")]
     pub fn check_constraints(&self) -> crate::check_constraints::CheckConstraints {
+        // Calling this method IS the acknowledgment (see the doc comment): record it so a
+        // data-adding commit to a constrained table is allowed to proceed.
+        self.check_constraints_acknowledged
+            .store(true, Ordering::Relaxed);
         let table_config = &self.effective_table_config;
         crate::check_constraints::constraints_from_configuration(
             table_config.metadata().configuration(),
@@ -589,11 +590,11 @@ impl<S> Transaction<S> {
         )
     }
 
-    /// Fails writes to tables with CHECK constraints unless the connector called
-    /// [`Self::with_check_constraints`].
+    /// Fails writes to tables with CHECK constraints unless the connector acknowledged them by
+    /// calling [`Self::check_constraints`].
     #[cfg(feature = "check-constraints-in-dev")]
     fn ensure_check_constraints_acknowledged(&self) -> DeltaResult<()> {
-        if !self.check_constraints_acknowledged
+        if !self.check_constraints_acknowledged.load(Ordering::Relaxed)
             && crate::check_constraints::has_check_constraints(
                 self.effective_table_config.metadata().configuration(),
             )
@@ -601,7 +602,7 @@ impl<S> Transaction<S> {
             return Err(Error::unsupported(
                 "table has CHECK constraints (delta.constraints.*); the connector must enforce \
                  them on every batch it writes and acknowledge this by calling \
-                 Transaction::with_check_constraints()",
+                 Transaction::check_constraints()",
             ));
         }
         Ok(())
@@ -1032,8 +1033,6 @@ impl<S: SupportsDataFiles> Transaction<S> {
         partition_values: HashMap<String, Scalar>,
     ) -> DeltaResult<WriteContext> {
         self.ensure_schema_non_empty_for_write_context()?;
-        #[cfg(feature = "check-constraints-in-dev")]
-        self.ensure_check_constraints_acknowledged()?;
         let shared = self.shared_write_state();
         require!(
             !shared.logical_partition_columns.is_empty(),
@@ -1092,8 +1091,6 @@ impl<S: SupportsDataFiles> Transaction<S> {
     /// [`partitioned_write_context`](Self::partitioned_write_context) instead).
     pub fn unpartitioned_write_context(&self) -> DeltaResult<WriteContext> {
         self.ensure_schema_non_empty_for_write_context()?;
-        #[cfg(feature = "check-constraints-in-dev")]
-        self.ensure_check_constraints_acknowledged()?;
         let shared = self.shared_write_state();
         require!(
             shared.logical_partition_columns.is_empty(),

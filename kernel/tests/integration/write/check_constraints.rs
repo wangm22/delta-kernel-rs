@@ -134,16 +134,17 @@ mod enabled {
     }
 
     #[tokio::test]
-    async fn write_context_requires_acknowledgment() -> Result<(), Box<dyn std::error::Error>> {
+    async fn write_context_creation_does_not_require_acknowledgment(
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let (table_url, engine) =
             setup_constrained_table("test_cc_gate_wc", &[("positive_amount", "amount > 0")])
                 .await?;
-        // No with_check_constraints() => write-context creation fails closed.
+        // Acknowledgment now happens by calling check_constraints() -- which may come after the
+        // write context is built -- so creating a write context no longer gates. The gate is at
+        // commit (see commit_requires_acknowledgment_only_when_adding_data).
         let txn = begin_txn(&table_url, &engine)?;
-        let err = txn
-            .unpartitioned_write_context()
-            .expect_err("write context must require check-constraint acknowledgment");
-        assert_err_contains(err, "with_check_constraints");
+        txn.unpartitioned_write_context()
+            .expect("write-context creation must not require acknowledgment");
         Ok(())
     }
 
@@ -170,7 +171,7 @@ mod enabled {
         let err = txn
             .commit(&engine)
             .expect_err("commit with add files must require acknowledgment");
-        assert_err_contains(err, "with_check_constraints");
+        assert_err_contains(err, "Transaction::check_constraints()");
         Ok(())
     }
 
@@ -184,7 +185,8 @@ mod enabled {
             &[("positive_amount", "amount > 0")],
         )
         .await?;
-        let txn = begin_txn(&table_url, &engine)?.with_check_constraints();
+        // Calling check_constraints() below is itself the acknowledgment (no separate opt-in).
+        let txn = begin_txn(&table_url, &engine)?;
 
         // Set-level question first: kernel can handle everything on this table.
         let constraints = txn.check_constraints();
@@ -233,9 +235,10 @@ mod enabled {
             &[("positive_amount", "( amount > 0 )")],
         )
         .await?;
-        let mut txn = begin_txn(&table_url, &engine)?
-            .with_check_constraints()
-            .with_operation("WRITE".to_string());
+        let mut txn = begin_txn(&table_url, &engine)?.with_operation("WRITE".to_string());
+        // DefaultEngine still requires the connector to acknowledge by calling check_constraints();
+        // write_parquet enforces per batch but does not itself acknowledge.
+        let _ = txn.check_constraints();
         let write_context = txn.unpartitioned_write_context()?;
 
         // Violating batch: rejected before any file is written.
@@ -267,7 +270,8 @@ mod enabled {
             &[("amount_range", "amount > 0 AND amount < 100")],
         )
         .await?;
-        let txn = begin_txn(&table_url, &engine)?.with_check_constraints();
+        // Calling check_constraints() below is itself the acknowledgment (no separate opt-in).
+        let txn = begin_txn(&table_url, &engine)?;
 
         // The connector's first, set-level question: can kernel handle all the constraints?
         let constraints = txn.check_constraints();
@@ -327,9 +331,7 @@ mod enabled {
             &["name"],
         )
         .await?;
-        let mut txn = begin_txn(&table_url, &engine)?
-            .with_check_constraints()
-            .with_operation("WRITE".to_string());
+        let mut txn = begin_txn(&table_url, &engine)?.with_operation("WRITE".to_string());
 
         let constraints = txn.check_constraints();
         let name_check = constraints
@@ -398,7 +400,8 @@ mod enabled {
             ],
         )
         .await?;
-        let txn = begin_txn(&table_url, &engine)?.with_check_constraints();
+        // No commit here -- this exercises the validator directly -- so no acknowledgment needed.
+        let txn = begin_txn(&table_url, &engine)?;
         let write_context = txn.unpartitioned_write_context()?;
 
         // Bind once...
