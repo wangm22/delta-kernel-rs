@@ -387,6 +387,128 @@ mod enabled {
         Ok(())
     }
 
+    /// A constraint referencing BOTH a partition column and a data column (`region != label`) is
+    /// kernel-evaluated per batch with the partition value overlaid from the write context -- no
+    /// connector SQL engine needed. It evaluates against the authoritative `add.partitionValues`
+    /// scalar, not whatever the batch carries for the partition column. The per-constraint path
+    /// (no write context) fails closed; a satisfying write commits and round-trips.
+    #[tokio::test]
+    async fn mixed_partition_and_data_constraint_evaluated_via_write_context(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        // Two STRING columns so a partition-vs-data comparison is well-typed; `region` partitions.
+        let schema = Arc::new(StructType::new_unchecked([
+            StructField::nullable("label", DataType::STRING),
+            StructField::nullable("region", DataType::STRING),
+        ]));
+        // Logical batches carry both columns. `region` is set to a deliberately wrong value below
+        // to prove the augment overlays the authoritative partition scalar instead of the batch.
+        let mk_batch = |labels: Vec<&str>,
+                        regions: Vec<&str>|
+         -> Result<ArrowEngineData, Box<dyn std::error::Error>> {
+            let arrow_schema = Arc::new(schema.as_ref().try_into_arrow()?);
+            Ok(ArrowEngineData::new(RecordBatch::try_new(
+                arrow_schema,
+                vec![
+                    Arc::new(StringArray::from(labels)) as ArrayRef,
+                    Arc::new(StringArray::from(regions)) as ArrayRef,
+                ],
+            )?))
+        };
+
+        let (store, engine, table_location): (Arc<DynObjectStore>, _, _) =
+            engine_store_setup("test_cc_mixed_partition", None);
+        let table_url = create_table_with_configuration(
+            store,
+            table_location,
+            schema.clone(),
+            &["region"],
+            true,
+            vec![],
+            vec!["checkConstraints"],
+            HashMap::from([(
+                "delta.constraints.region_ne_label".to_string(),
+                "region != label".to_string(),
+            )]),
+        )
+        .await?;
+
+        let mut txn = begin_txn(&table_url, &engine)?.with_operation("WRITE".to_string());
+
+        // The mixed constraint is kernel-parsable, classified as partition-augmented.
+        let constraints = txn.check_constraints();
+        assert!(constraints.is_kernel_parsable());
+        let constraint = constraints
+            .iter()
+            .exactly_one()
+            .expect("table has exactly one constraint");
+        assert_eq!(
+            constraint.enforcement(),
+            CheckConstraintEnforcement::DataAndPartitionValues
+        );
+
+        // Without a write context (no partition values), the per-constraint path fails closed.
+        let err = constraint
+            .validate(
+                &mk_batch(vec!["x"], vec!["US"])?,
+                engine.evaluation_handler().as_ref(),
+            )
+            .expect_err("a mixed constraint needs a partitioned write context to evaluate");
+        assert_err_contains(err, "partitioned write context");
+
+        // With the write context, kernel overlays region = "US" onto each batch and evaluates
+        // `region != label`. Satisfying: no label equals "US" (batch region values are ignored).
+        let write_context = txn.partitioned_write_context(HashMap::from([(
+            "region".to_string(),
+            Scalar::from("US"),
+        )]))?;
+        let handler = engine.evaluation_handler();
+        write_context.validate_check_constraints(
+            &mk_batch(vec!["EU", "ASIA"], vec!["zz", "zz"])?,
+            handler.as_ref(),
+        )?;
+
+        // Violating: row 1's label equals the partition value "US" -> `"US" != "US"` is false.
+        let err = write_context
+            .validate_check_constraints(
+                &mk_batch(vec!["EU", "US"], vec!["zz", "zz"])?,
+                handler.as_ref(),
+            )
+            .expect_err("a row whose label equals the partition value must violate");
+        match err {
+            Error::CheckConstraintViolation {
+                name,
+                expression,
+                details,
+            } => {
+                assert_eq!(name, "region_ne_label");
+                assert_eq!(expression, "region != label");
+                assert!(details.contains("row 1"), "locates the row: {details}");
+            }
+            other => panic!("expected CheckConstraintViolation, got: {other:?}"),
+        }
+
+        // The partition value is authoritative: even though this batch's own `region` column says
+        // "not-us", kernel overlays the write context's "US", so a row with label "US" violates.
+        write_context
+            .validate_check_constraints(&mk_batch(vec!["US"], vec!["not-us"])?, handler.as_ref())
+            .expect_err("augment must use the authoritative partition value, not the batch column");
+
+        // The DefaultEngine write path enforces it automatically; a satisfying write commits and
+        // round-trips, with `region` reconstructed from `add.partitionValues`.
+        let add_files = engine
+            .write_parquet(
+                &mk_batch(vec!["EU", "ASIA"], vec!["US", "US"])?,
+                &write_context,
+            )
+            .await?;
+        txn.add_files(add_files);
+        txn.commit(&engine)?.unwrap_committed();
+
+        let expected = mk_batch(vec!["EU", "ASIA"], vec!["US", "US"])?;
+        test_read(&expected, &table_url, Arc::new(engine))?;
+        Ok(())
+    }
+
     /// A `CheckConstraintValidator` binds evaluators once and validates many batches; a
     /// violation surfaces as the matchable `Error::CheckConstraintViolation` variant.
     #[tokio::test]

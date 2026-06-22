@@ -1082,6 +1082,10 @@ impl<S: SupportsDataFiles> Transaction<S> {
         Ok(WriteContext {
             shared: shared.clone(),
             physical_partition_values: serialized,
+            // Retain the logical partition scalars so a partition+data CHECK constraint can be
+            // evaluated per batch with these values overlaid (see CheckConstraintValidator).
+            #[cfg(feature = "check-constraints-in-dev")]
+            partition_values: normalized,
         })
     }
 
@@ -1099,6 +1103,8 @@ impl<S: SupportsDataFiles> Transaction<S> {
         Ok(WriteContext {
             shared: shared.clone(),
             physical_partition_values: HashMap::new(),
+            #[cfg(feature = "check-constraints-in-dev")]
+            partition_values: HashMap::new(),
         })
     }
 

@@ -13,6 +13,7 @@ use crate::table_features::ColumnMappingMode;
 #[cfg(feature = "check-constraints-in-dev")]
 use crate::{
     check_constraints::{CheckConstraintValidator, CheckConstraints},
+    expressions::Scalar,
     EngineData, EvaluationHandler,
 };
 use crate::{DeltaResult, Error};
@@ -77,6 +78,12 @@ pub struct WriteContext {
     /// Empty for unpartitioned tables. Ordering for hive-style paths comes from
     /// `shared.logical_partition_columns`, not from this map.
     pub(super) physical_partition_values: HashMap<String, Option<String>>,
+    /// Logical partition column name -> scalar value for this write context (empty for
+    /// unpartitioned tables). Lets kernel evaluate a CHECK constraint that references both
+    /// partition and data columns by overlaying these scalars onto each batch; see
+    /// `CheckConstraintValidator::try_new_for_write_context`.
+    #[cfg(feature = "check-constraints-in-dev")]
+    pub(super) partition_values: HashMap<String, Scalar>,
 }
 
 impl WriteContext {
@@ -230,7 +237,13 @@ impl WriteContext {
         &self,
         evaluation_handler: &dyn EvaluationHandler,
     ) -> DeltaResult<CheckConstraintValidator> {
-        self.shared.check_constraints.validator(evaluation_handler)
+        // Pass this write context's partition values so a constraint referencing both partition
+        // and data columns can be evaluated (the partition scalars are overlaid onto each batch).
+        CheckConstraintValidator::try_new_for_write_context(
+            &self.shared.check_constraints,
+            &self.partition_values,
+            evaluation_handler,
+        )
     }
 
     /// Validates `batch` (logical data, matching [`Self::logical_schema`]) against every CHECK
@@ -384,6 +397,8 @@ mod tests {
         WriteContext {
             shared,
             physical_partition_values: partition_values,
+            #[cfg(feature = "check-constraints-in-dev")]
+            partition_values: HashMap::new(),
         }
     }
 
