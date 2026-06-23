@@ -266,6 +266,12 @@ pub struct Transaction<S = ExistingTable> {
     // (`AtomicBool`) because acknowledgment flows through a `&self` accessor; read at commit time.
     #[cfg(feature = "check-constraints-in-dev")]
     check_constraints_acknowledged: AtomicBool,
+    // Parsed CHECK constraints, cached on first use and shared by discovery
+    // (`check_constraints()`) and the write path, so a transaction parses its constraint set
+    // at most once. Sound because the set is invariant for the transaction's lifetime (ALTER
+    // TABLE cannot change constraints).
+    #[cfg(feature = "check-constraints-in-dev")]
+    parsed_check_constraints: OnceLock<crate::check_constraints::CheckConstraints>,
     // Files matched by update_deletion_vectors() with new DV descriptors appended. These are used
     // to generate remove/add action pairs during commit, ensuring file statistics are preserved.
     dv_matched_files: Vec<FilteredEngineData>,
@@ -582,12 +588,23 @@ impl<S> Transaction<S> {
         // data-adding commit to a constrained table is allowed to proceed.
         self.check_constraints_acknowledged
             .store(true, Ordering::Relaxed);
-        let table_config = &self.effective_table_config;
-        crate::check_constraints::constraints_from_configuration(
-            table_config.metadata().configuration(),
-            table_config.logical_schema(),
-            table_config.partition_columns(),
-        )
+        self.parsed_check_constraints().clone()
+    }
+
+    /// The table's parsed CHECK constraints, parsed once and cached. Both discovery
+    /// ([`Self::check_constraints`]) and the write path route through here, so a transaction parses
+    /// its constraint set at most once. Sound because the set is invariant for the transaction's
+    /// lifetime (ALTER TABLE cannot add, remove, or modify constraints).
+    #[cfg(feature = "check-constraints-in-dev")]
+    fn parsed_check_constraints(&self) -> &crate::check_constraints::CheckConstraints {
+        self.parsed_check_constraints.get_or_init(|| {
+            let table_config = &self.effective_table_config;
+            crate::check_constraints::constraints_from_configuration(
+                table_config.metadata().configuration(),
+                table_config.logical_schema(),
+                table_config.partition_columns(),
+            )
+        })
     }
 
     /// Fails writes to tables with CHECK constraints unless the connector acknowledged them by
@@ -983,11 +1000,7 @@ impl<S: SupportsDataFiles> Transaction<S> {
                 randomize_file_prefixes,
                 random_prefix_length,
                 #[cfg(feature = "check-constraints-in-dev")]
-                check_constraints: crate::check_constraints::constraints_from_configuration(
-                    table_config.metadata().configuration(),
-                    table_config.logical_schema(),
-                    table_config.partition_columns(),
-                ),
+                check_constraints: self.parsed_check_constraints().clone(),
             })
         })
     }

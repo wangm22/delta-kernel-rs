@@ -90,7 +90,7 @@ pub(crate) fn constraints_from_configuration(
         .collect();
     // HashMap iteration order is unstable; sort for deterministic discovery and error ordering.
     constraints.sort_by(|a, b| a.name.cmp(&b.name));
-    CheckConstraints(constraints)
+    CheckConstraints(constraints.into())
 }
 
 /// All CHECK constraints on a table. Dereferences to a slice for per-constraint access.
@@ -101,8 +101,11 @@ pub(crate) fn constraints_from_configuration(
 /// context) and the connector proceeds normally. If not, the connector must evaluate the
 /// remaining raw SQL itself -- [`connector_enforced`](Self::connector_enforced) yields exactly
 /// those constraints -- or fail the write.
+// `Arc<[_]>` (not `Vec`) so cloning the set is an O(1) refcount bump -- the transaction caches one
+// parse and hands out cheap clones to discovery and the write path (see
+// `constraints_from_configuration`).
 #[derive(Debug, Clone, Default)]
-pub struct CheckConstraints(Vec<CheckConstraint>);
+pub struct CheckConstraints(Arc<[CheckConstraint]>);
 
 impl CheckConstraints {
     /// True if kernel parsed every constraint, i.e. no constraint requires
