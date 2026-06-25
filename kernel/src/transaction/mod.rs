@@ -572,9 +572,10 @@ impl<S> Transaction<S> {
     /// ```ignore
     /// let constraints = txn.check_constraints();
     /// if constraints.is_kernel_parsable() {
-    ///     // Kernel enforces everything: data-batch constraints per batch (automatic in the
-    ///     // default engine's write_parquet, or via constraints.validator(handler)), and
-    ///     // partition-column constraints when each partitioned write context is created.
+    ///     // Kernel enforces everything when you validate via the write context: automatic in the
+    ///     // default engine's write_parquet, or build wc.check_constraint_validator(handler) once
+    ///     // and validate each batch (data-batch and partition+data per batch; partition-column
+    ///     // once, against the write context's partition values).
     /// } else {
     ///     // Kernel cannot evaluate some constraints; evaluate their raw SQL yourself or fail.
     ///     for constraint in constraints.connector_enforced() {
@@ -1058,16 +1059,6 @@ impl<S: SupportsDataFiles> Transaction<S> {
             &shared.logical_partition_columns,
             &shared.logical_schema,
             partition_values,
-        )?;
-
-        // Enforce partition-column CHECK constraints against this write context's partition
-        // values. Partition values are per-file constants (readers reconstruct partition columns
-        // from add.partitionValues), so this is the protocol-correct enforcement point -- and it
-        // needs no engine: kernel evaluates the predicates over the scalars directly.
-        #[cfg(feature = "check-constraints-in-dev")]
-        crate::check_constraints::enforce_on_partition_values(
-            &shared.check_constraints,
-            &normalized,
         )?;
 
         // Serialize values and translate keys from logical to physical names.

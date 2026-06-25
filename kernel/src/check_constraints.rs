@@ -20,11 +20,11 @@
 //!     default engine validates automatically in `write_parquet`; custom engines must validate (or
 //!     enforce the raw SQL with their own evaluator) on every batch before writing.
 //!   - [`PartitionValues`](CheckConstraintEnforcement::PartitionValues): kernel itself evaluates
-//!     the constraint -- no engine needed -- against the partition values supplied to
-//!     `Transaction::partitioned_write_context`, rejecting the write context on violation. Readers
-//!     reconstruct partition columns from `add.partitionValues` rather than from file data, which
-//!     makes the write context's partition values the protocol-correct enforcement point for such
-//!     constraints.
+//!     the constraint -- no engine needed -- against the write context's partition values, once,
+//!     when a validator is built from a partitioned write context (the default engine does this in
+//!     `write_parquet`). Readers reconstruct partition columns from `add.partitionValues` rather
+//!     than from file data, which makes the write context's partition values the protocol-correct
+//!     enforcement point for such constraints.
 //!   - [`Connector`](CheckConstraintEnforcement::Connector): the expression is outside the subset
 //!     kernel's constraint parser supports (currently single column-vs-literal comparisons, e.g.
 //!     `col1 < 10`); the connector must enforce the raw SQL itself, and kernel-driven validation
@@ -109,15 +109,15 @@ pub struct CheckConstraints(Arc<[CheckConstraint]>);
 
 impl CheckConstraints {
     /// True if kernel parsed every constraint, i.e. no constraint requires
-    /// [`Connector`](CheckConstraintEnforcement::Connector) enforcement. Kernel then enforces
-    /// all of them: data-batch constraints via [`CheckConstraintValidator`] (automatic in the
-    /// default engine's `write_parquet`), partition-column constraints when each partitioned write
-    /// context is created, and partition+data constraints
-    /// ([`DataAndPartitionValues`](CheckConstraintEnforcement::DataAndPartitionValues)) per batch
-    /// through a partitioned write context's validator. The last kind needs partition values, so
-    /// the bare [`validator`](Self::validator) fails closed on it -- enforce it via
-    /// `WriteContext::check_constraint_validator` / `validate_check_constraints` (the default
-    /// engine's `write_parquet` already does).
+    /// [`Connector`](CheckConstraintEnforcement::Connector) enforcement. Kernel then enforces all
+    /// of them when a validator is built from the write context (automatic in the default engine's
+    /// `write_parquet`): data-batch and partition+data
+    /// ([`DataAndPartitionValues`](CheckConstraintEnforcement::DataAndPartitionValues)) constraints
+    /// per batch, and partition-column
+    /// ([`PartitionValues`](CheckConstraintEnforcement::PartitionValues)) constraints once, against
+    /// the write context's partition values. The latter two need partition values, so the bare
+    /// [`validator`](Self::validator) fails closed on them -- enforce them via
+    /// `WriteContext::check_constraint_validator` / `validate_check_constraints`.
     pub fn is_kernel_parsable(&self) -> bool {
         self.0
             .iter()
@@ -133,11 +133,12 @@ impl CheckConstraints {
             .filter(|c| c.enforcement() == CheckConstraintEnforcement::Connector)
     }
 
-    /// Binds the data-batch-enforced constraints to `evaluation_handler` for per-batch
-    /// validation; equivalent to [`CheckConstraintValidator::try_new`]. Fails closed if any
-    /// constraint is connector-enforced, or references both partition and data columns
-    /// ([`DataAndPartitionValues`](CheckConstraintEnforcement::DataAndPartitionValues)) -- the
-    /// latter needs partition values, so enforce it via `WriteContext::check_constraint_validator`
+    /// Binds the kernel-evaluable constraints to `evaluation_handler` for per-batch validation;
+    /// equivalent to [`CheckConstraintValidator::try_new`]. Fails closed if any constraint is
+    /// connector-enforced, or depends on partition values (the
+    /// [`PartitionValues`](CheckConstraintEnforcement::PartitionValues) and
+    /// [`DataAndPartitionValues`](CheckConstraintEnforcement::DataAndPartitionValues) kinds) --
+    /// those need a write context, so build one via `WriteContext::check_constraint_validator`
     /// instead. Check [`is_kernel_parsable`](Self::is_kernel_parsable) first and handle the
     /// [`connector_enforced`](Self::connector_enforced) remainder to avoid the connector error.
     pub fn validator(
@@ -161,7 +162,7 @@ impl std::ops::Deref for CheckConstraints {
 /// values are per-file constants, so no engine is needed. Constraints with other enforcement
 /// kinds are skipped (data-batch constraints are validated per batch; connector-enforced
 /// constraints fail closed when a validator is built).
-pub(crate) fn enforce_on_partition_values(
+fn enforce_on_partition_values(
     constraints: &[CheckConstraint],
     partition_values: &HashMap<String, Scalar>,
 ) -> DeltaResult<()> {
@@ -212,11 +213,11 @@ pub enum CheckConstraintEnforcement {
     /// [`CheckConstraintValidator`] (the default engine does this automatically in
     /// `write_parquet`).
     DataBatches,
-    /// The constraint references a partition column, so kernel evaluates it against the
-    /// partition values of each partitioned write context (partition values are per-file
-    /// constants, and readers reconstruct partition columns from `add.partitionValues`).
-    /// Connectors that do not create kernel write contexts must enforce the constraint against
-    /// their own partition values.
+    /// The constraint references a partition column, so kernel evaluates it against the write
+    /// context's partition values (per-file constants; readers reconstruct partition columns from
+    /// `add.partitionValues`) -- once, when a validator is built from a partitioned write context
+    /// (e.g. the default engine's `write_parquet`). Connectors that do not build kernel validators
+    /// must enforce the constraint against their own partition values.
     PartitionValues,
     /// The constraint references both partition and data columns. Kernel evaluates it per data
     /// batch via a [`CheckConstraintValidator`], but only one built from a partitioned write
@@ -360,8 +361,8 @@ impl CheckConstraint {
     /// # Errors
     ///
     /// - The constraint is not batch-enforced: partition-value-enforced constraints are checked
-    ///   when creating a partitioned write context, not against batches, and connector-enforced
-    ///   constraints fail closed (see [`Self::enforcement`]).
+    ///   against the write context's partition values (build a validator from it), not against
+    ///   batches, and connector-enforced constraints fail closed (see [`Self::enforcement`]).
     /// - [`Error::CheckConstraintViolation`] if any row evaluates to `false` or `NULL` (the
     ///   protocol counts both as violations).
     /// - The engine fails to evaluate the predicate.
@@ -373,8 +374,9 @@ impl CheckConstraint {
         if let ConstraintSupport::PartitionValues { column, .. } = &self.support {
             return Err(Error::unsupported(format!(
                 "CHECK constraint '{}' ({}) references partition column '{}' and is enforced \
-                 against partition values when creating a partitioned write context, not against \
-                 data batches",
+                 against the write context's partition values when a validator is built from it \
+                 (e.g. WriteContext::check_constraint_validator / validate_check_constraints), not \
+                 against data batches passed here",
                 self.name, self.raw_sql, column
             )));
         }
@@ -395,14 +397,15 @@ impl CheckConstraint {
         ))
     }
 
-    /// The fail-closed error for a partition+data constraint when no partitioned write context
-    /// (hence no partition values) is available to evaluate it against.
+    /// The fail-closed error for a constraint that depends on partition values when no partitioned
+    /// write context (hence no partition values) is available to evaluate it against. Covers both
+    /// partition-only ([`ConstraintSupport::PartitionValues`]) and mixed
+    /// ([`ConstraintSupport::DataAndPartition`]) constraints.
     fn partition_context_required_error(&self) -> Error {
         Error::unsupported(format!(
-            "CHECK constraint '{}' ({}) references both partition and data columns; it can only \
-             be evaluated through a partitioned write context (e.g. \
-             WriteContext::check_constraint_validator / validate_check_constraints), which \
-             supplies the partition values kernel overlays onto each batch",
+            "CHECK constraint '{}' ({}) depends on partition values; it can only be evaluated \
+             through a partitioned write context (e.g. WriteContext::check_constraint_validator / \
+             validate_check_constraints), which supplies them",
             self.name, self.raw_sql
         ))
     }
@@ -505,14 +508,15 @@ struct BoundConstraint {
     values_renderer: Option<ViolationValuesRenderer>,
 }
 
-/// The table's data-batch-enforced CHECK constraints bound to an engine's [`EvaluationHandler`],
+/// The table's kernel-evaluable CHECK constraints bound to an engine's [`EvaluationHandler`],
 /// ready to validate batches. Build it once per write and reuse it for every batch: construction
 /// surfaces connector-enforced constraints immediately (fail closed, before any data is written)
 /// and amortizes predicate-evaluator creation across batches.
 ///
-/// Partition-value-enforced constraints are skipped here: kernel enforces them when creating
-/// each partitioned write context. Connectors that do not create kernel write contexts must
-/// enforce them against their own partition values.
+/// Partition-value-enforced constraints are evaluated once at construction, against the write
+/// context's partition values; a validator built without them (the bare [`Self::try_new`]) fails
+/// closed on them. Connectors that do not build kernel validators must enforce such constraints
+/// against their own partition values.
 ///
 /// Custom engines obtain one from `WriteContext::check_constraint_validator`, or directly from
 /// the constraints returned by `Transaction::check_constraints`.
@@ -547,8 +551,8 @@ fn build_partition_augment(
 
 impl CheckConstraintValidator {
     /// Binds `constraints` to `evaluation_handler`, erroring (fail closed) if any constraint is
-    /// connector-enforced, or references both partition and data columns (the latter needs a
-    /// partitioned write context's partition values, which this constructor does not supply). A
+    /// connector-enforced, or depends on partition values (the partition-only and partition+data
+    /// kinds need a write context's partition values, which this constructor does not supply). A
     /// connector that enforces such constraints with its own SQL engine should filter them out and
     /// bind only the remainder.
     pub fn try_new(
@@ -567,6 +571,13 @@ impl CheckConstraintValidator {
         partition_values: &HashMap<String, Scalar>,
         evaluation_handler: &dyn EvaluationHandler,
     ) -> DeltaResult<Self> {
+        // Partition-only constraints need no data batch: enforce them here, once, against the
+        // write context's partition values (the per-batch loop below skips them). With a write
+        // context (non-empty map) this is the partition-value enforcement point; without one, the
+        // loop fails them closed, mirroring DataAndPartition.
+        if !partition_values.is_empty() {
+            enforce_on_partition_values(constraints, partition_values)?;
+        }
         let mut bound = Vec::new();
         for constraint in constraints {
             let (predicate, augment) = match &constraint.support {
@@ -582,8 +593,15 @@ impl CheckConstraintValidator {
                     )?;
                     (predicate, Some(augment))
                 }
-                // Enforced against the write context's partition values, not data batches.
-                ConstraintSupport::PartitionValues { .. } => continue,
+                // Enforced above (once) against the write context's partition values, not per
+                // batch. Without a write context (empty map), kernel cannot evaluate it -> fail
+                // closed, mirroring DataAndPartition.
+                ConstraintSupport::PartitionValues { .. } => {
+                    if partition_values.is_empty() {
+                        return Err(constraint.partition_context_required_error());
+                    }
+                    continue;
+                }
                 ConstraintSupport::Unsupported(_) => {
                     return Err(constraint.connector_enforced_error())
                 }

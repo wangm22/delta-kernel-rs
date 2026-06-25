@@ -316,9 +316,10 @@ mod enabled {
     }
 
     /// Constraints referencing a partition column are enforced by kernel itself (no engine)
-    /// against the partition values when the partitioned write context is created; constraints
-    /// on data columns of the same table stay batch-enforced. A satisfying write commits and
-    /// round-trips, with the partition column reconstructed from `add.partitionValues`.
+    /// against the partition values when a validator is built from the partitioned write context
+    /// (e.g. inside `write_parquet`); constraints on data columns of the same table stay
+    /// batch-enforced. A satisfying write commits and round-trips, with the partition column
+    /// reconstructed from `add.partitionValues`.
     #[tokio::test]
     async fn partition_column_constraint_enforced_on_write_context(
     ) -> Result<(), Box<dyn std::error::Error>> {
@@ -351,17 +352,23 @@ mod enabled {
             .expect_err("batch validation must redirect to partition-value enforcement");
         assert_err_contains(err, "partition column 'name'");
 
-        // Violating partition values reject the write context outright...
+        // Partition-only constraints are no longer enforced at context creation; building a
+        // validator from the context (which `write_parquet` does) evaluates them against the
+        // partition values. A violating partition value is rejected at that point...
         let partition = |name: Scalar| HashMap::from([("name".to_string(), name)]);
-        let err = txn
-            .partitioned_write_context(partition(Scalar::from("b")))
+        let bad_ctx = txn.partitioned_write_context(partition(Scalar::from("b")))?;
+        let err = engine
+            .write_parquet(&batch(vec![Some(1)], vec!["b"])?, &bad_ctx)
+            .await
             .map(|_| ())
             .expect_err("partition value 'b' must violate name_check");
         assert_err_contains(err, "name_check");
 
-        // ...as do NULL partition values (only `true` passes).
-        let err = txn
-            .partitioned_write_context(partition(Scalar::Null(DataType::STRING)))
+        // ...as are NULL partition values (only `true` passes).
+        let null_ctx = txn.partitioned_write_context(partition(Scalar::Null(DataType::STRING)))?;
+        let err = engine
+            .write_parquet(&batch(vec![Some(1)], vec!["a"])?, &null_ctx)
+            .await
             .map(|_| ())
             .expect_err("NULL partition value must violate name_check");
         assert_err_contains(err, "NULL");
