@@ -30,7 +30,7 @@
 //!     `col1 < 10`); the connector must enforce the raw SQL itself, and kernel-driven validation
 //!     fails closed.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, LazyLock};
 
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
@@ -40,6 +40,7 @@ use crate::kernel_predicates::{DefaultKernelPredicateEvaluator, KernelPredicateE
 use crate::schema::{
     column_name, ColumnName, ColumnNamesAndTypes, DataType, SchemaRef, StructField, StructType,
 };
+use crate::table_configuration::TableConfiguration;
 use crate::utils::require;
 use crate::{
     DeltaResult, EngineData, Error, EvaluationHandler, ExpressionEvaluator, PredicateEvaluator,
@@ -91,6 +92,59 @@ pub(crate) fn constraints_from_configuration(
     // HashMap iteration order is unstable; sort for deterministic discovery and error ordering.
     constraints.sort_by(|a, b| a.name.cmp(&b.name));
     CheckConstraints(constraints.into())
+}
+
+/// A fingerprint of everything a CHECK-constraint validation depends on: the constraint set (the
+/// `delta.constraints.*` configuration entries), the logical schema, and the partition columns.
+///
+/// Two table states with equal fingerprints classify, parse, and evaluate every constraint
+/// identically, so data validated against one is still valid against the other. On a commit
+/// conflict a connector compares its transaction's fingerprint (what its data was validated
+/// against) with the rebased snapshot's fingerprint: equal means it may retry the commit *without*
+/// re-validating (a fast retry); unequal means the constraints must be re-checked against the new
+/// table state first.
+///
+/// Schema and partition columns are part of the fingerprint, not just the SQL: the same constraint
+/// text can classify or parse differently under a changed schema (a referenced column dropped or
+/// type-widened) or a changed partition spec (data-only vs partition-only vs mixed), so comparing
+/// the SQL alone would be unsound. Unrelated configuration changes (other table properties) are
+/// excluded, so they never force a needless re-validation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckConstraintFingerprint {
+    /// Constraint name -> raw SQL. A `BTreeMap` so equality is independent of configuration order.
+    constraints: BTreeMap<String, String>,
+    schema: SchemaRef,
+    partition_columns: Vec<String>,
+}
+
+impl CheckConstraintFingerprint {
+    /// Builds a fingerprint from a table's configuration, logical schema, and partition columns.
+    fn new(
+        configuration: &HashMap<String, String>,
+        schema: SchemaRef,
+        partition_columns: &[String],
+    ) -> Self {
+        let constraints = configuration
+            .iter()
+            .filter_map(|(key, sql)| {
+                strip_constraint_prefix(key).map(|name| (name.to_string(), sql.clone()))
+            })
+            .collect();
+        Self {
+            constraints,
+            schema,
+            partition_columns: partition_columns.to_vec(),
+        }
+    }
+
+    /// Builds a fingerprint from a [`TableConfiguration`] -- a snapshot's or a transaction's.
+    pub(crate) fn from_table_configuration(table_config: &TableConfiguration) -> Self {
+        Self::new(
+            table_config.metadata().configuration(),
+            table_config.logical_schema(),
+            table_config.partition_columns(),
+        )
+    }
 }
 
 /// All CHECK constraints on a table. Dereferences to a slice for per-constraint access.
@@ -770,6 +824,82 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect()
+    }
+
+    #[test]
+    fn fingerprint_tracks_constraints_schema_and_partition_columns() {
+        let pc = vec!["name".to_string()];
+        let base = CheckConstraintFingerprint::new(
+            &config(&[("delta.constraints.c", "amount > 0")]),
+            schema(),
+            &pc,
+        );
+        // Identical inputs -> equal (a fast retry is sound).
+        assert_eq!(
+            base,
+            CheckConstraintFingerprint::new(
+                &config(&[("delta.constraints.c", "amount > 0")]),
+                schema(),
+                &pc,
+            )
+        );
+        // An unrelated table-property change is excluded -> still equal (no needless
+        // re-validation).
+        assert_eq!(
+            base,
+            CheckConstraintFingerprint::new(
+                &config(&[
+                    ("delta.constraints.c", "amount > 0"),
+                    ("delta.appendOnly", "true")
+                ]),
+                schema(),
+                &pc,
+            )
+        );
+        // Changed SQL -> differ.
+        assert_ne!(
+            base,
+            CheckConstraintFingerprint::new(
+                &config(&[("delta.constraints.c", "amount > 5")]),
+                schema(),
+                &pc,
+            )
+        );
+        // Added constraint -> differ.
+        assert_ne!(
+            base,
+            CheckConstraintFingerprint::new(
+                &config(&[
+                    ("delta.constraints.c", "amount > 0"),
+                    ("delta.constraints.d", "amount < 100"),
+                ]),
+                schema(),
+                &pc,
+            )
+        );
+        // Changed partition columns -> differ (data-only vs partition-only vs mixed
+        // classification).
+        assert_ne!(
+            base,
+            CheckConstraintFingerprint::new(
+                &config(&[("delta.constraints.c", "amount > 0")]),
+                schema(),
+                &[]
+            )
+        );
+        // Changed schema (amount LONG -> INTEGER) -> differ (parsing/coercion can change).
+        let retyped = Arc::new(StructType::new_unchecked([
+            StructField::nullable("amount", DataType::INTEGER),
+            StructField::nullable("name", DataType::STRING),
+        ]));
+        assert_ne!(
+            base,
+            CheckConstraintFingerprint::new(
+                &config(&[("delta.constraints.c", "amount > 0")]),
+                retyped,
+                &pc
+            )
+        );
     }
 
     #[test]

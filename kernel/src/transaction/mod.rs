@@ -608,6 +608,31 @@ impl<S> Transaction<S> {
         })
     }
 
+    /// A fingerprint of the CHECK-constraint validation context this transaction validated its
+    /// data against -- its constraints, logical schema, and partition columns (see
+    /// [`CheckConstraintFingerprint`](crate::check_constraints::CheckConstraintFingerprint)). Pair
+    /// it with [`Self::check_constraints_require_revalidation`] on a commit conflict.
+    #[cfg(feature = "check-constraints-in-dev")]
+    pub fn check_constraint_fingerprint(
+        &self,
+    ) -> crate::check_constraints::CheckConstraintFingerprint {
+        crate::check_constraints::CheckConstraintFingerprint::from_table_configuration(
+            &self.effective_table_config,
+        )
+    }
+
+    /// On a commit conflict, whether the connector must re-validate its already-written data
+    /// before retrying the commit against `rebased` (the snapshot the retry will build on).
+    ///
+    /// Returns `false` -- a *fast retry*, reuse the existing validation -- only when the CHECK
+    /// constraints, schema, and partition columns are identical between the snapshot this
+    /// transaction validated against and `rebased`. Returns `true` when any of them changed, in
+    /// which case the data must be re-checked against the new constraints before committing.
+    #[cfg(feature = "check-constraints-in-dev")]
+    pub fn check_constraints_require_revalidation(&self, rebased: &Snapshot) -> bool {
+        self.check_constraint_fingerprint() != rebased.check_constraint_fingerprint()
+    }
+
     /// Fails writes to tables with CHECK constraints unless the connector acknowledged them by
     /// calling [`Self::check_constraints`].
     #[cfg(feature = "check-constraints-in-dev")]

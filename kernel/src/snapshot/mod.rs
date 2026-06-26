@@ -372,6 +372,21 @@ impl Snapshot {
         &self.table_configuration
     }
 
+    /// A fingerprint of this snapshot's CHECK-constraint validation context -- its constraints,
+    /// logical schema, and partition columns. On a commit conflict, compare it with the
+    /// transaction's
+    /// [`check_constraint_fingerprint`](crate::transaction::Transaction::check_constraint_fingerprint)
+    /// to decide whether already-validated data must be re-checked against this (rebased) snapshot.
+    /// See [`CheckConstraintFingerprint`](crate::check_constraints::CheckConstraintFingerprint).
+    #[cfg(feature = "check-constraints-in-dev")]
+    pub fn check_constraint_fingerprint(
+        &self,
+    ) -> crate::check_constraints::CheckConstraintFingerprint {
+        crate::check_constraints::CheckConstraintFingerprint::from_table_configuration(
+            self.table_configuration(),
+        )
+    }
+
     /// Fetch the latest version of the provided `application_id` for this snapshot. Filters the
     /// txn based on the delta.setTransactionRetentionDuration property and lastUpdated.
     ///
