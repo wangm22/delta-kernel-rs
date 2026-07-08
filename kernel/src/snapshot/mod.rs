@@ -75,6 +75,11 @@ pub struct Snapshot {
     /// means `crc.version == self.version()` and the CRC can be queried at zero I/O. `None`
     /// means no CRC was loadable (no CRC on disk at this version, or the read failed).
     crc: Option<Arc<Crc>>,
+    /// The table's parsed CHECK constraints, parsed lazily on first access and cached (see
+    /// [`Snapshot::check_constraints`]). Sound to cache for a snapshot's lifetime because a
+    /// snapshot is an immutable view of one table version.
+    #[cfg(feature = "check-constraints-in-dev")]
+    parsed_check_constraints: std::sync::OnceLock<crate::check_constraints::CheckConstraints>,
 }
 
 impl PartialEq for Snapshot {
@@ -168,6 +173,8 @@ impl Snapshot {
             log_segment,
             table_configuration,
             crc,
+            #[cfg(feature = "check-constraints-in-dev")]
+            parsed_check_constraints: std::sync::OnceLock::new(),
         })
     }
 
@@ -318,6 +325,35 @@ impl Snapshot {
         self.table_configuration().table_properties()
     }
 
+    /// The table's CHECK constraints at this snapshot's version.
+    ///
+    /// This is **discovery only** -- a snapshot is an immutable, read-only view, so calling this
+    /// does not acknowledge the constraints or affect any commit gate (unlike
+    /// [`Transaction::check_constraints`], where the call *is* the acknowledgment). A connector
+    /// that discovers constraints here and later commits must still call
+    /// [`Transaction::check_constraints`] on its transaction, or the data-adding commit fails
+    /// closed.
+    ///
+    /// Use it to validate data against the table's constraints *before* building a transaction --
+    /// e.g. a streaming connector that acknowledges a write to its client before opening a
+    /// transaction can validate here first -- or to re-discover constraints on a rebased snapshot
+    /// after a commit conflict.
+    ///
+    /// The set is parsed on first call and cached for the snapshot's lifetime (sound because a
+    /// snapshot's table version, and thus its constraints, never change).
+    #[cfg(feature = "check-constraints-in-dev")]
+    pub fn check_constraints(&self) -> crate::check_constraints::CheckConstraints {
+        self.parsed_check_constraints
+            .get_or_init(|| {
+                let table_config = self.table_configuration();
+                crate::check_constraints::constraints_from_configuration(
+                    table_config.metadata().configuration(),
+                    table_config.logical_schema(),
+                )
+            })
+            .clone()
+    }
+
     /// Returns the protocol-derived table properties as a map of key-value pairs.
     ///
     /// This includes:
@@ -370,21 +406,6 @@ impl Snapshot {
     #[internal_api]
     pub(crate) fn table_configuration(&self) -> &TableConfiguration {
         &self.table_configuration
-    }
-
-    /// A fingerprint of this snapshot's CHECK-constraint validation context -- its constraints,
-    /// logical schema, and partition columns. On a commit conflict, compare it with the
-    /// transaction's
-    /// [`check_constraint_fingerprint`](crate::transaction::Transaction::check_constraint_fingerprint)
-    /// to decide whether already-validated data must be re-checked against this (rebased) snapshot.
-    /// See [`CheckConstraintFingerprint`](crate::check_constraints::CheckConstraintFingerprint).
-    #[cfg(feature = "check-constraints-in-dev")]
-    pub fn check_constraint_fingerprint(
-        &self,
-    ) -> crate::check_constraints::CheckConstraintFingerprint {
-        crate::check_constraints::CheckConstraintFingerprint::from_table_configuration(
-            self.table_configuration(),
-        )
     }
 
     /// Fetch the latest version of the provided `application_id` for this snapshot. Filters the
@@ -2296,5 +2317,80 @@ mod tests {
         let mut new_log_segment = baseline.log_segment().clone();
         mutate(&mut new_log_segment.listed, &new_log_segment.log_root);
         Snapshot::new(new_log_segment, baseline.table_configuration().clone()).unwrap()
+    }
+
+    #[cfg(feature = "check-constraints-in-dev")]
+    #[tokio::test]
+    async fn test_snapshot_check_constraints_discovers_and_caches() {
+        let storage = Arc::new(InMemory::new());
+        let table_root = "memory:///";
+        let engine = SyncEngine::new_with_store(storage.clone());
+
+        // A table with two constraints: one kernel can parse (a simple comparison) and one it
+        // cannot (a junction -> connector-enforced).
+        let actions = vec![
+            json!({"commitInfo": {"timestamp": 123, "operation": "CREATE TABLE"}}),
+            json!({"protocol": {
+                "minReaderVersion": 3,
+                "minWriterVersion": 7,
+                "readerFeatures": [],
+                "writerFeatures": ["checkConstraints"]
+            }}),
+            json!({"metaData": {
+                "id": "test-id",
+                "format": {"provider": "parquet", "options": {}},
+                "schemaString": "{\"type\":\"struct\",\"fields\":[{\"name\":\"amount\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}}]}",
+                "partitionColumns": [],
+                "configuration": {
+                    "delta.constraints.positive": "amount > 0",
+                    "delta.constraints.range": "amount > 0 AND amount < 100"
+                },
+                "createdTime": 1234567890
+            }}),
+        ];
+        commit(table_root, &storage, 0, actions).await;
+
+        let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
+
+        let constraints = snapshot.check_constraints();
+        assert_eq!(constraints.len(), 2);
+        // Discovered sorted by name; `positive` parses, `range` (a junction) is connector-enforced.
+        assert_eq!(constraints[0].name(), "positive");
+        assert!(constraints[0].predicate().is_some());
+        assert_eq!(constraints[1].name(), "range");
+        assert!(constraints[1].predicate().is_none());
+        assert!(!constraints.is_kernel_parsable());
+        assert_eq!(constraints.connector_enforced().count(), 1);
+
+        // Repeated calls return the cached (equal) set.
+        let again = snapshot.check_constraints();
+        let names_first: Vec<_> = constraints.iter().map(|c| c.name()).collect();
+        let names_again: Vec<_> = again.iter().map(|c| c.name()).collect();
+        assert_eq!(names_first, names_again);
+    }
+
+    #[cfg(feature = "check-constraints-in-dev")]
+    #[tokio::test]
+    async fn test_snapshot_check_constraints_empty_when_none_declared() {
+        let storage = Arc::new(InMemory::new());
+        let table_root = "memory:///";
+        let engine = SyncEngine::new_with_store(storage.clone());
+
+        let actions = vec![
+            json!({"commitInfo": {"timestamp": 123, "operation": "CREATE TABLE"}}),
+            json!({"protocol": {"minReaderVersion": 1, "minWriterVersion": 2}}),
+            json!({"metaData": {
+                "id": "test-id",
+                "format": {"provider": "parquet", "options": {}},
+                "schemaString": "{\"type\":\"struct\",\"fields\":[{\"name\":\"amount\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}}]}",
+                "partitionColumns": [],
+                "configuration": {},
+                "createdTime": 1234567890
+            }}),
+        ];
+        commit(table_root, &storage, 0, actions).await;
+
+        let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
+        assert!(snapshot.check_constraints().is_empty());
     }
 }

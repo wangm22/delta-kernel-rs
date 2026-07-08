@@ -277,11 +277,9 @@ impl<E: TaskExecutor> DefaultEngine<E> {
         data: &ArrowEngineData,
         write_context: &WriteContext,
     ) -> DeltaResult<Box<dyn EngineData>> {
-        // Enforce CHECK constraints on the logical batch before the logical-to-physical
-        // transform: constraints reference logical column names, which column mapping renames.
-        #[cfg(feature = "check-constraints-in-dev")]
-        write_context.validate_check_constraints(data, self.evaluation.as_ref())?;
-
+        // NB: CHECK constraints are NOT enforced here. Enforcement is the connector's
+        // responsibility, run over all data before partitioning (see the check_constraints module);
+        // write_parquet is post-partition and per-file and cannot express "the whole write fails."
         let transform = write_context.logical_to_physical();
         let input_schema = Schema::try_from_arrow(data.record_batch().schema())?;
         let output_schema = write_context.physical_schema();

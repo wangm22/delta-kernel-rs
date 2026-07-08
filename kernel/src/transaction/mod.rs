@@ -572,10 +572,10 @@ impl<S> Transaction<S> {
     /// ```ignore
     /// let constraints = txn.check_constraints();
     /// if constraints.is_kernel_parsable() {
-    ///     // Kernel enforces everything when you validate via the write context: automatic in the
-    ///     // default engine's write_parquet, or build wc.check_constraint_validator(handler) once
-    ///     // and validate each batch (data-batch and partition+data per batch; partition-column
-    ///     // once, against the write context's partition values).
+    ///     // Build a validator once and run it over the full logical batch BEFORE partitioning
+    ///     // (partition columns are present as ordinary data), then partition and write.
+    ///     let validator = constraints.validator(engine.evaluation_handler().as_ref())?;
+    ///     validator.validate(&batch)?;
     /// } else {
     ///     // Kernel cannot evaluate some constraints; evaluate their raw SQL yourself or fail.
     ///     for constraint in constraints.connector_enforced() {
@@ -603,34 +603,8 @@ impl<S> Transaction<S> {
             crate::check_constraints::constraints_from_configuration(
                 table_config.metadata().configuration(),
                 table_config.logical_schema(),
-                table_config.partition_columns(),
             )
         })
-    }
-
-    /// A fingerprint of the CHECK-constraint validation context this transaction validated its
-    /// data against -- its constraints, logical schema, and partition columns (see
-    /// [`CheckConstraintFingerprint`](crate::check_constraints::CheckConstraintFingerprint)). Pair
-    /// it with [`Self::check_constraints_require_revalidation`] on a commit conflict.
-    #[cfg(feature = "check-constraints-in-dev")]
-    pub fn check_constraint_fingerprint(
-        &self,
-    ) -> crate::check_constraints::CheckConstraintFingerprint {
-        crate::check_constraints::CheckConstraintFingerprint::from_table_configuration(
-            &self.effective_table_config,
-        )
-    }
-
-    /// On a commit conflict, whether the connector must re-validate its already-written data
-    /// before retrying the commit against `rebased` (the snapshot the retry will build on).
-    ///
-    /// Returns `false` -- a *fast retry*, reuse the existing validation -- only when the CHECK
-    /// constraints, schema, and partition columns are identical between the snapshot this
-    /// transaction validated against and `rebased`. Returns `true` when any of them changed, in
-    /// which case the data must be re-checked against the new constraints before committing.
-    #[cfg(feature = "check-constraints-in-dev")]
-    pub fn check_constraints_require_revalidation(&self, rebased: &Snapshot) -> bool {
-        self.check_constraint_fingerprint() != rebased.check_constraint_fingerprint()
     }
 
     /// Fails writes to tables with CHECK constraints unless the connector acknowledged them by
@@ -1025,8 +999,6 @@ impl<S: SupportsDataFiles> Transaction<S> {
                 logical_partition_columns: table_config.partition_columns().to_vec(),
                 randomize_file_prefixes,
                 random_prefix_length,
-                #[cfg(feature = "check-constraints-in-dev")]
-                check_constraints: self.parsed_check_constraints().clone(),
             })
         })
     }
@@ -1111,10 +1083,6 @@ impl<S: SupportsDataFiles> Transaction<S> {
         Ok(WriteContext {
             shared: shared.clone(),
             physical_partition_values: serialized,
-            // Retain the logical partition scalars so a partition+data CHECK constraint can be
-            // evaluated per batch with these values overlaid (see CheckConstraintValidator).
-            #[cfg(feature = "check-constraints-in-dev")]
-            partition_values: normalized,
         })
     }
 
@@ -1132,8 +1100,6 @@ impl<S: SupportsDataFiles> Transaction<S> {
         Ok(WriteContext {
             shared: shared.clone(),
             physical_partition_values: HashMap::new(),
-            #[cfg(feature = "check-constraints-in-dev")]
-            partition_values: HashMap::new(),
         })
     }
 

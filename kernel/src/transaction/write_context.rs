@@ -10,12 +10,6 @@ use crate::expressions::{ColumnName, ExpressionRef};
 use crate::partition::hive::{build_partition_path, uri_encode_path};
 use crate::schema::SchemaRef;
 use crate::table_features::ColumnMappingMode;
-#[cfg(feature = "check-constraints-in-dev")]
-use crate::{
-    check_constraints::{CheckConstraintValidator, CheckConstraints},
-    expressions::Scalar,
-    EngineData, EvaluationHandler,
-};
 use crate::{DeltaResult, Error};
 
 /// Table-wide write state shared across all [`WriteContext`] instances created by a
@@ -41,11 +35,6 @@ pub(super) struct SharedWriteState {
     /// of the random prefix in [`WriteContext::write_dir`] for both the column mapping and
     /// `randomizeFilePrefixes` paths.
     pub(super) random_prefix_length: NonZero<usize>,
-    /// The table's CHECK constraints (parsed where kernel supports the expression). Every batch
-    /// must satisfy them before its files are added; see
-    /// [`WriteContext::validate_check_constraints`].
-    #[cfg(feature = "check-constraints-in-dev")]
-    pub(super) check_constraints: CheckConstraints,
 }
 
 /// A write context for a specific partition or an unpartitioned table. Created by
@@ -78,12 +67,6 @@ pub struct WriteContext {
     /// Empty for unpartitioned tables. Ordering for hive-style paths comes from
     /// `shared.logical_partition_columns`, not from this map.
     pub(super) physical_partition_values: HashMap<String, Option<String>>,
-    /// Logical partition column name -> scalar value for this write context (empty for
-    /// unpartitioned tables). Lets kernel evaluate a CHECK constraint that references both
-    /// partition and data columns by overlaying these scalars onto each batch; see
-    /// `CheckConstraintValidator::try_new_for_write_context`.
-    #[cfg(feature = "check-constraints-in-dev")]
-    pub(super) partition_values: HashMap<String, Scalar>,
 }
 
 impl WriteContext {
@@ -216,52 +199,6 @@ impl WriteContext {
         &self.physical_partition_values
     }
 
-    /// The table's CHECK constraints (a convenience accessor; the same constraints are returned by
-    /// `Transaction::check_constraints`). Custom engines must ensure every batch they write
-    /// satisfies these before adding the resulting files -- either via
-    /// [`Self::validate_check_constraints`], or with their own SQL engine for constraints kernel
-    /// could not parse. Note: calling this does not satisfy the acknowledgment gate; calling
-    /// `Transaction::check_constraints` does.
-    #[cfg(feature = "check-constraints-in-dev")]
-    pub fn check_constraints(&self) -> &CheckConstraints {
-        &self.shared.check_constraints
-    }
-
-    /// Binds the table's CHECK constraints to `evaluation_handler`, returning a
-    /// [`CheckConstraintValidator`] to run against every batch before writing it. Build the
-    /// validator once per write context and reuse it: construction fails closed immediately if
-    /// any constraint is not kernel-evaluable, and reuse amortizes predicate-evaluator creation
-    /// across batches.
-    #[cfg(feature = "check-constraints-in-dev")]
-    pub fn check_constraint_validator(
-        &self,
-        evaluation_handler: &dyn EvaluationHandler,
-    ) -> DeltaResult<CheckConstraintValidator> {
-        // Pass this write context's partition values so a constraint referencing both partition
-        // and data columns can be evaluated (the partition scalars are overlaid onto each batch).
-        CheckConstraintValidator::try_new_for_write_context(
-            &self.shared.check_constraints,
-            &self.partition_values,
-            evaluation_handler,
-        )
-    }
-
-    /// Validates `batch` (logical data, matching [`Self::logical_schema`]) against every CHECK
-    /// constraint on the table, erroring on the first violation and failing closed on
-    /// constraints kernel cannot evaluate. The default engine's `write_parquet` calls this
-    /// automatically; custom engines should call it (or otherwise enforce each constraint) on
-    /// every batch before writing. To validate many batches, prefer building a
-    /// [`Self::check_constraint_validator`] once and reusing it.
-    #[cfg(feature = "check-constraints-in-dev")]
-    pub fn validate_check_constraints(
-        &self,
-        batch: &dyn EngineData,
-        evaluation_handler: &dyn EvaluationHandler,
-    ) -> DeltaResult<()> {
-        self.check_constraint_validator(evaluation_handler)?
-            .validate(batch)
-    }
-
     /// Builds the Hive-style partition path suffix (e.g., `year=2024/region=US/`).
     /// Only called when column mapping is OFF.
     fn hive_partition_path_suffix(&self) -> String {
@@ -391,14 +328,10 @@ mod tests {
             randomize_file_prefixes,
             random_prefix_length: NonZero::new(random_prefix_length)
                 .expect("test prefix length must be > 0"),
-            #[cfg(feature = "check-constraints-in-dev")]
-            check_constraints: CheckConstraints::default(),
         });
         WriteContext {
             shared,
             physical_partition_values: partition_values,
-            #[cfg(feature = "check-constraints-in-dev")]
-            partition_values: HashMap::new(),
         }
     }
 

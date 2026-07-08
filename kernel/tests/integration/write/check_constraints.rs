@@ -55,7 +55,6 @@ mod enabled {
 
     use delta_kernel::arrow::array::{ArrayRef, Int64Array, StringArray};
     use delta_kernel::arrow::record_batch::RecordBatch;
-    use delta_kernel::check_constraints::CheckConstraintEnforcement;
     use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
     use delta_kernel::engine::arrow_data::ArrowEngineData;
     use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
@@ -198,10 +197,8 @@ mod enabled {
             .expect("table has exactly one constraint");
         assert_eq!(constraint.name(), "positive_amount");
         assert_eq!(constraint.raw_sql(), "amount > 0");
-        assert_eq!(
-            constraint.enforcement(),
-            CheckConstraintEnforcement::DataBatches
-        );
+        // Kernel parsed it; the batch-validation calls below prove it is data-batch enforced.
+        assert!(constraint.predicate().is_some());
 
         let evaluation_handler = engine.evaluation_handler();
 
@@ -225,33 +222,34 @@ mod enabled {
         Ok(())
     }
 
-    /// Approach B: a DefaultEngine connector gets per-batch enforcement automatically inside
-    /// `write_parquet`; a satisfying write commits and round-trips.
+    /// A DefaultEngine connector validates each batch explicitly (via the constraints' validator)
+    /// before writing it -- `write_parquet` does not validate. A violating batch is caught, and a
+    /// satisfying write commits and round-trips.
     #[tokio::test]
-    async fn default_engine_auto_enforces_on_write() -> Result<(), Box<dyn std::error::Error>> {
+    async fn connector_validates_batch_before_write() -> Result<(), Box<dyn std::error::Error>> {
         // Spark stores parser-round-tripped, token-spaced expression text; use that style here.
         let (table_url, engine) = setup_constrained_table(
-            "test_cc_auto_enforce",
+            "test_cc_validate_before_write",
             &[("positive_amount", "( amount > 0 )")],
         )
         .await?;
         let mut txn = begin_txn(&table_url, &engine)?.with_operation("WRITE".to_string());
-        // DefaultEngine still requires the connector to acknowledge by calling check_constraints();
-        // write_parquet enforces per batch but does not itself acknowledge.
-        let _ = txn.check_constraints();
+        // Calling check_constraints() acknowledges; build a validator to enforce before writing.
+        let constraints = txn.check_constraints();
+        let handler = engine.evaluation_handler();
+        let validator = constraints.validator(handler.as_ref())?;
         let write_context = txn.unpartitioned_write_context()?;
 
-        // Violating batch: rejected before any file is written.
+        // Violating batch: the connector's validation catches it before any file is written.
         let bad = batch(vec![Some(1), Some(-5)], vec!["a", "b"])?;
-        let err = engine
-            .write_parquet(&bad, &write_context)
-            .await
-            .map(|_| ())
-            .expect_err("write_parquet must reject a violating batch");
+        let err = validator
+            .validate(&bad)
+            .expect_err("validation must reject a violating batch");
         assert_err_contains(err, "positive_amount");
 
-        // Satisfying batch: written, committed, and readable.
+        // Satisfying batch: validate, then write, commit, and read back.
         let good = batch(vec![Some(1), Some(5)], vec!["a", "b"])?;
+        validator.validate(&good)?;
         let add_files_metadata = engine.write_parquet(&good, &write_context).await?;
         txn.add_files(add_files_metadata);
         txn.commit(&engine)?.unwrap_committed();
@@ -262,7 +260,7 @@ mod enabled {
     }
 
     /// Constraints kernel cannot parse (here: a junction, outside the simple-comparison
-    /// subset) are surfaced as connector-enforced and fail the DefaultEngine path closed.
+    /// subset) are surfaced as connector-enforced, and building a validator over them fails closed.
     #[tokio::test]
     async fn non_parsable_constraint_fails_closed() -> Result<(), Box<dyn std::error::Error>> {
         let (table_url, engine) = setup_constrained_table(
@@ -283,15 +281,14 @@ mod enabled {
         let [raw] = raw[..] else {
             panic!("table has exactly one connector-enforced constraint");
         };
-        assert_eq!(raw.enforcement(), CheckConstraintEnforcement::Connector);
+        assert!(raw.predicate().is_none());
         assert_eq!(raw.raw_sql(), "amount > 0 AND amount < 100");
 
-        // The DefaultEngine path cannot evaluate it, so it must not write at all.
-        let write_context = txn.unpartitioned_write_context()?;
-        let good = batch(vec![Some(1)], vec!["a"])?;
-        let err = engine
-            .write_parquet(&good, &write_context)
-            .await
+        // Kernel cannot evaluate it, so building a validator fails closed -- a DefaultEngine
+        // connector with no SQL engine of its own must refuse to write.
+        let handler = engine.evaluation_handler();
+        let err = constraints
+            .validator(handler.as_ref())
             .map(|_| ())
             .expect_err("non-parsable constraint must fail closed");
         assert_err_contains(err, "must enforce");
@@ -315,13 +312,13 @@ mod enabled {
         Ok(())
     }
 
-    /// Constraints referencing a partition column are enforced by kernel itself (no engine)
-    /// against the partition values when a validator is built from the partitioned write context
-    /// (e.g. inside `write_parquet`); constraints on data columns of the same table stay
-    /// batch-enforced. A satisfying write commits and round-trips, with the partition column
-    /// reconstructed from `add.partitionValues`.
+    /// Constraints on a partition column are validated as ordinary predicates over the full
+    /// (pre-partition) batch, which still carries the partition column as data -- no special
+    /// partition handling. A data-column constraint on the same table validates the same way. A
+    /// satisfying write commits and round-trips, with the partition column reconstructed from
+    /// `add.partitionValues`.
     #[tokio::test]
-    async fn partition_column_constraint_enforced_on_write_context(
+    async fn partition_column_constraint_validates_over_full_batch(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let (table_url, engine) = setup_constrained_table_partitioned(
             "test_cc_partition_col",
@@ -334,58 +331,30 @@ mod enabled {
         .await?;
         let mut txn = begin_txn(&table_url, &engine)?.with_operation("WRITE".to_string());
 
+        // Both constraints parse (the partition-column one is just a predicate).
         let constraints = txn.check_constraints();
-        let name_check = constraints
-            .iter()
-            .find(|c| c.name() == "name_check")
-            .expect("name_check constraint exists");
-        assert_eq!(
-            name_check.enforcement(),
-            CheckConstraintEnforcement::PartitionValues
-        );
-        // Batch validation is the wrong tool for a partition-value-enforced constraint.
-        let err = name_check
-            .validate(
-                &batch(vec![Some(1)], vec!["a"])?,
-                engine.evaluation_handler().as_ref(),
-            )
-            .expect_err("batch validation must redirect to partition-value enforcement");
-        assert_err_contains(err, "partition column 'name'");
+        assert!(constraints.is_kernel_parsable());
+        let handler = engine.evaluation_handler();
+        let validator = constraints.validator(handler.as_ref())?;
 
-        // Partition-only constraints are no longer enforced at context creation; building a
-        // validator from the context (which `write_parquet` does) evaluates them against the
-        // partition values. A violating partition value is rejected at that point...
-        let partition = |name: Scalar| HashMap::from([("name".to_string(), name)]);
-        let bad_ctx = txn.partitioned_write_context(partition(Scalar::from("b")))?;
-        let err = engine
-            .write_parquet(&batch(vec![Some(1)], vec!["b"])?, &bad_ctx)
-            .await
-            .map(|_| ())
-            .expect_err("partition value 'b' must violate name_check");
+        // A row violating the partition-column constraint (name != 'a') is caught.
+        let err = validator
+            .validate(&batch(vec![Some(1)], vec!["b"])?)
+            .expect_err("name 'b' must violate name_check");
         assert_err_contains(err, "name_check");
 
-        // ...as are NULL partition values (only `true` passes).
-        let null_ctx = txn.partitioned_write_context(partition(Scalar::Null(DataType::STRING)))?;
-        let err = engine
-            .write_parquet(&batch(vec![Some(1)], vec!["a"])?, &null_ctx)
-            .await
-            .map(|_| ())
-            .expect_err("NULL partition value must violate name_check");
-        assert_err_contains(err, "NULL");
-
-        // Satisfying partition values produce a write context; the data-column constraint is
-        // still enforced per batch on it.
-        let write_context = txn.partitioned_write_context(partition(Scalar::from("a")))?;
-        let err = engine
-            .write_parquet(&batch(vec![Some(-5)], vec!["a"])?, &write_context)
-            .await
-            .map(|_| ())
-            .expect_err("negative amount must still violate positive_amount");
+        // A row violating the data-column constraint (amount <= 0) is caught too.
+        let err = validator
+            .validate(&batch(vec![Some(-5)], vec!["a"])?)
+            .expect_err("negative amount must violate positive_amount");
         assert_err_contains(err, "positive_amount");
 
-        let add_files_metadata = engine
-            .write_parquet(&batch(vec![Some(5)], vec!["a"])?, &write_context)
-            .await?;
+        // A satisfying batch validates; write it to the matching partition, commit, and read back.
+        let good = batch(vec![Some(5)], vec!["a"])?;
+        validator.validate(&good)?;
+        let write_context = txn
+            .partitioned_write_context(HashMap::from([("name".to_string(), Scalar::from("a"))]))?;
+        let add_files_metadata = engine.write_parquet(&good, &write_context).await?;
         txn.add_files(add_files_metadata);
         txn.commit(&engine)?.unwrap_committed();
 
@@ -395,20 +364,18 @@ mod enabled {
     }
 
     /// A constraint referencing BOTH a partition column and a data column (`region != label`) is
-    /// kernel-evaluated per batch with the partition value overlaid from the write context -- no
-    /// connector SQL engine needed. It evaluates against the authoritative `add.partitionValues`
-    /// scalar, not whatever the batch carries for the partition column. The per-constraint path
-    /// (no write context) fails closed; a satisfying write commits and round-trips.
+    /// just a predicate over the full pre-partition batch, which carries both columns as data -- no
+    /// connector SQL engine and no partition overlay needed. A satisfying write commits and
+    /// round-trips, with `region` reconstructed from `add.partitionValues`.
     #[tokio::test]
-    async fn mixed_partition_and_data_constraint_evaluated_via_write_context(
+    async fn mixed_partition_and_data_constraint_validates_over_full_batch(
     ) -> Result<(), Box<dyn std::error::Error>> {
         // Two STRING columns so a partition-vs-data comparison is well-typed; `region` partitions.
         let schema = Arc::new(StructType::new_unchecked([
             StructField::nullable("label", DataType::STRING),
             StructField::nullable("region", DataType::STRING),
         ]));
-        // Logical batches carry both columns. `region` is set to a deliberately wrong value below
-        // to prove the augment overlays the authoritative partition scalar instead of the batch.
+        // Pre-partition batches carry both columns with their real per-row values.
         let mk_batch = |labels: Vec<&str>,
                         regions: Vec<&str>|
          -> Result<ArrowEngineData, Box<dyn std::error::Error>> {
@@ -441,46 +408,25 @@ mod enabled {
 
         let mut txn = begin_txn(&table_url, &engine)?.with_operation("WRITE".to_string());
 
-        // The mixed constraint is kernel-parsable, classified as partition-augmented.
+        // The mixed constraint is kernel-parsable: a plain comparison over two batch columns.
         let constraints = txn.check_constraints();
         assert!(constraints.is_kernel_parsable());
         let constraint = constraints
             .iter()
             .exactly_one()
             .expect("table has exactly one constraint");
-        assert_eq!(
-            constraint.enforcement(),
-            CheckConstraintEnforcement::DataAndPartitionValues
-        );
+        assert!(constraint.predicate().is_some());
 
-        // Without a write context (no partition values), the per-constraint path fails closed.
-        let err = constraint
-            .validate(
-                &mk_batch(vec!["x"], vec!["US"])?,
-                engine.evaluation_handler().as_ref(),
-            )
-            .expect_err("a mixed constraint needs a partitioned write context to evaluate");
-        assert_err_contains(err, "partitioned write context");
-
-        // With the write context, kernel overlays region = "US" onto each batch and evaluates
-        // `region != label`. Satisfying: no label equals "US" (batch region values are ignored).
-        let write_context = txn.partitioned_write_context(HashMap::from([(
-            "region".to_string(),
-            Scalar::from("US"),
-        )]))?;
         let handler = engine.evaluation_handler();
-        write_context.validate_check_constraints(
-            &mk_batch(vec!["EU", "ASIA"], vec!["zz", "zz"])?,
-            handler.as_ref(),
-        )?;
+        let validator = constraints.validator(handler.as_ref())?;
 
-        // Violating: row 1's label equals the partition value "US" -> `"US" != "US"` is false.
-        let err = write_context
-            .validate_check_constraints(
-                &mk_batch(vec!["EU", "US"], vec!["zz", "zz"])?,
-                handler.as_ref(),
-            )
-            .expect_err("a row whose label equals the partition value must violate");
+        // Satisfying: no row has region == label.
+        validator.validate(&mk_batch(vec!["EU", "ASIA"], vec!["US", "US"])?)?;
+
+        // Violating: row 1 has region == label ("US" == "US") -> `region != label` is false.
+        let err = validator
+            .validate(&mk_batch(vec!["EU", "US"], vec!["US", "US"])?)
+            .expect_err("a row whose region equals its label must violate");
         match err {
             Error::CheckConstraintViolation {
                 name,
@@ -494,20 +440,15 @@ mod enabled {
             other => panic!("expected CheckConstraintViolation, got: {other:?}"),
         }
 
-        // The partition value is authoritative: even though this batch's own `region` column says
-        // "not-us", kernel overlays the write context's "US", so a row with label "US" violates.
-        write_context
-            .validate_check_constraints(&mk_batch(vec!["US"], vec!["not-us"])?, handler.as_ref())
-            .expect_err("augment must use the authoritative partition value, not the batch column");
-
-        // The DefaultEngine write path enforces it automatically; a satisfying write commits and
-        // round-trips, with `region` reconstructed from `add.partitionValues`.
-        let add_files = engine
-            .write_parquet(
-                &mk_batch(vec!["EU", "ASIA"], vec!["US", "US"])?,
-                &write_context,
-            )
-            .await?;
+        // A satisfying write commits and round-trips, with `region` reconstructed from
+        // `add.partitionValues`.
+        let good = mk_batch(vec!["EU", "ASIA"], vec!["US", "US"])?;
+        validator.validate(&good)?;
+        let write_context = txn.partitioned_write_context(HashMap::from([(
+            "region".to_string(),
+            Scalar::from("US"),
+        )]))?;
+        let add_files = engine.write_parquet(&good, &write_context).await?;
         txn.add_files(add_files);
         txn.commit(&engine)?.unwrap_committed();
 
@@ -529,13 +470,14 @@ mod enabled {
             ],
         )
         .await?;
-        // No commit here -- this exercises the validator directly -- so no acknowledgment needed.
+        // No commit here -- this exercises the validator directly.
         let txn = begin_txn(&table_url, &engine)?;
-        let write_context = txn.unpartitioned_write_context()?;
 
         // Bind once...
         let evaluation_handler = engine.evaluation_handler();
-        let validator = write_context.check_constraint_validator(evaluation_handler.as_ref())?;
+        let validator = txn
+            .check_constraints()
+            .validator(evaluation_handler.as_ref())?;
 
         // ...validate many batches.
         validator.validate(&batch(vec![Some(1), Some(2)], vec!["a", "b"])?)?;

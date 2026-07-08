@@ -11,36 +11,33 @@
 //!   of reading the table's constraints is the acknowledgment. Without it, kernel fails data-adding
 //!   commits to constrained tables so that connectors unaware of the feature cannot silently commit
 //!   violating data.
-//! - `Transaction::check_constraints` (and `WriteContext::check_constraints`) expose each
-//!   constraint's raw SQL plus, when kernel can evaluate the expression, a kernel predicate.
-//! - Each constraint reports where it is enforced via [`CheckConstraint::enforcement`]:
-//!   - [`DataBatches`](CheckConstraintEnforcement::DataBatches): a [`CheckConstraintValidator`]
-//!     binds the constraint to the engine's [`EvaluationHandler`] once per write and checks every
-//!     batch, erroring with [`Error::CheckConstraintViolation`] on the first violating row. The
-//!     default engine validates automatically in `write_parquet`; custom engines must validate (or
-//!     enforce the raw SQL with their own evaluator) on every batch before writing.
-//!   - [`PartitionValues`](CheckConstraintEnforcement::PartitionValues): kernel itself evaluates
-//!     the constraint -- no engine needed -- against the write context's partition values, once,
-//!     when a validator is built from a partitioned write context (the default engine does this in
-//!     `write_parquet`). Readers reconstruct partition columns from `add.partitionValues` rather
-//!     than from file data, which makes the write context's partition values the protocol-correct
-//!     enforcement point for such constraints.
-//!   - [`Connector`](CheckConstraintEnforcement::Connector): the expression is outside the subset
-//!     kernel's constraint parser supports (currently single column-vs-literal comparisons, e.g.
-//!     `col1 < 10`); the connector must enforce the raw SQL itself, and kernel-driven validation
-//!     fails closed.
+//! - `Transaction::check_constraints` (discovery + acknowledgment) and
+//!   `Snapshot::check_constraints` (discovery only) expose each constraint's raw SQL plus, when
+//!   kernel can evaluate the expression, a kernel predicate.
+//! - Kernel parses each constraint it can ([`CheckConstraint::predicate`] is then `Some`) and
+//!   enforces it when the connector runs a [`CheckConstraintValidator`] (built via
+//!   [`CheckConstraints::validator`]) over its data, erroring with
+//!   [`Error::CheckConstraintViolation`] on the first violating row. Each constraint is a plain
+//!   predicate the engine's [`EvaluationHandler`] evaluates against a batch. The connector
+//!   validates the full logical batch *before partitioning*, so partition columns are present as
+//!   ordinary per-row data and need no special handling -- the value validated is the value that
+//!   determines the partition, hence what readers reconstruct from `add.partitionValues`.
+//!   Enforcement is not wired into `write_parquet` or any write-context step; the connector runs
+//!   the validator itself, before it partitions or writes.
+//! - A constraint kernel cannot parse ([`CheckConstraint::predicate`] is `None`, surfaced by
+//!   [`CheckConstraints::connector_enforced`]) -- currently anything beyond a single
+//!   column-vs-literal comparison like `col1 < 10` -- must be enforced by the connector's own SQL
+//!   engine; kernel-driven validation fails closed.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use crate::expressions::UnaryExpressionOp::ToJson;
-use crate::expressions::{parse_sql_simple_predicate, Expression, Predicate, Scalar};
-use crate::kernel_predicates::{DefaultKernelPredicateEvaluator, KernelPredicateEvaluator as _};
+use crate::expressions::{parse_sql_simple_predicate, Expression, Predicate};
 use crate::schema::{
     column_name, ColumnName, ColumnNamesAndTypes, DataType, SchemaRef, StructField, StructType,
 };
-use crate::table_configuration::TableConfiguration;
 use crate::utils::require;
 use crate::{
     DeltaResult, EngineData, Error, EvaluationHandler, ExpressionEvaluator, PredicateEvaluator,
@@ -70,23 +67,17 @@ pub(crate) fn has_check_constraints(configuration: &HashMap<String, String>) -> 
 
 /// Extracts all CHECK constraints from the table configuration, attempting to parse each one
 /// against `schema`. Constraints kernel cannot evaluate are still returned (with
-/// [`CheckConstraint::enforcement`] reporting [`CheckConstraintEnforcement::Connector`]) so that
-/// connectors with their own SQL engine can enforce them from the raw SQL.
+/// [`CheckConstraint::predicate`] returning `None`) so that connectors with their own SQL engine
+/// can enforce them from the raw SQL.
 pub(crate) fn constraints_from_configuration(
     configuration: &HashMap<String, String>,
     schema: SchemaRef,
-    partition_columns: &[String],
 ) -> CheckConstraints {
     let mut constraints: Vec<_> = configuration
         .iter()
         .filter_map(|(key, sql)| {
             let name = strip_constraint_prefix(key)?;
-            Some(CheckConstraint::new(
-                name,
-                sql,
-                schema.clone(),
-                partition_columns,
-            ))
+            Some(CheckConstraint::new(name, sql, schema.clone()))
         })
         .collect();
     // HashMap iteration order is unstable; sort for deterministic discovery and error ordering.
@@ -94,107 +85,40 @@ pub(crate) fn constraints_from_configuration(
     CheckConstraints(constraints.into())
 }
 
-/// A fingerprint of everything a CHECK-constraint validation depends on: the constraint set (the
-/// `delta.constraints.*` configuration entries), the logical schema, and the partition columns.
-///
-/// Two table states with equal fingerprints classify, parse, and evaluate every constraint
-/// identically, so data validated against one is still valid against the other. On a commit
-/// conflict a connector compares its transaction's fingerprint (what its data was validated
-/// against) with the rebased snapshot's fingerprint: equal means it may retry the commit *without*
-/// re-validating (a fast retry); unequal means the constraints must be re-checked against the new
-/// table state first.
-///
-/// Schema and partition columns are part of the fingerprint, not just the SQL: the same constraint
-/// text can classify or parse differently under a changed schema (a referenced column dropped or
-/// type-widened) or a changed partition spec (data-only vs partition-only vs mixed), so comparing
-/// the SQL alone would be unsound. Unrelated configuration changes (other table properties) are
-/// excluded, so they never force a needless re-validation.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CheckConstraintFingerprint {
-    /// Constraint name -> raw SQL. A `BTreeMap` so equality is independent of configuration order.
-    constraints: BTreeMap<String, String>,
-    schema: SchemaRef,
-    partition_columns: Vec<String>,
-}
-
-impl CheckConstraintFingerprint {
-    /// Builds a fingerprint from a table's configuration, logical schema, and partition columns.
-    fn new(
-        configuration: &HashMap<String, String>,
-        schema: SchemaRef,
-        partition_columns: &[String],
-    ) -> Self {
-        let constraints = configuration
-            .iter()
-            .filter_map(|(key, sql)| {
-                strip_constraint_prefix(key).map(|name| (name.to_string(), sql.clone()))
-            })
-            .collect();
-        Self {
-            constraints,
-            schema,
-            partition_columns: partition_columns.to_vec(),
-        }
-    }
-
-    /// Builds a fingerprint from a [`TableConfiguration`] -- a snapshot's or a transaction's.
-    pub(crate) fn from_table_configuration(table_config: &TableConfiguration) -> Self {
-        Self::new(
-            table_config.metadata().configuration(),
-            table_config.logical_schema(),
-            table_config.partition_columns(),
-        )
-    }
-}
-
 /// All CHECK constraints on a table. Dereferences to a slice for per-constraint access.
 ///
 /// The first question a connector asks is set-level, so it is answered here:
 /// [`is_kernel_parsable`](Self::is_kernel_parsable) reports whether kernel parsed *every*
-/// constraint. If it did, kernel enforces them all (per data batch or per partitioned write
-/// context) and the connector proceeds normally. If not, the connector must evaluate the
-/// remaining raw SQL itself -- [`connector_enforced`](Self::connector_enforced) yields exactly
-/// those constraints -- or fail the write.
-// `Arc<[_]>` (not `Vec`) so cloning the set is an O(1) refcount bump -- the transaction caches one
-// parse and hands out cheap clones to discovery and the write path (see
-// `constraints_from_configuration`).
+/// constraint. If it did, the connector builds a [`validator`](Self::validator) and runs it over
+/// its data. If not, the connector must evaluate the remaining raw SQL itself --
+/// [`connector_enforced`](Self::connector_enforced) yields exactly those constraints -- or fail
+/// the write.
+// `Arc<[_]>` (not `Vec`) so cloning the set is an O(1) refcount bump; callers (the transaction and
+// snapshot discovery caches) hand out cheap clones of a single parse.
 #[derive(Debug, Clone, Default)]
 pub struct CheckConstraints(Arc<[CheckConstraint]>);
 
 impl CheckConstraints {
-    /// True if kernel parsed every constraint, i.e. no constraint requires
-    /// [`Connector`](CheckConstraintEnforcement::Connector) enforcement. Kernel then enforces all
-    /// of them when a validator is built from the write context (automatic in the default engine's
-    /// `write_parquet`): data-batch and partition+data
-    /// ([`DataAndPartitionValues`](CheckConstraintEnforcement::DataAndPartitionValues)) constraints
-    /// per batch, and partition-column
-    /// ([`PartitionValues`](CheckConstraintEnforcement::PartitionValues)) constraints once, against
-    /// the write context's partition values. The latter two need partition values, so the bare
-    /// [`validator`](Self::validator) fails closed on them -- enforce them via
-    /// `WriteContext::check_constraint_validator` / `validate_check_constraints`.
+    /// True if kernel parsed every constraint -- none require a connector to enforce them. The
+    /// connector can then build a [`validator`](Self::validator) and let kernel evaluate all of
+    /// them; otherwise it must handle the [`connector_enforced`](Self::connector_enforced)
+    /// remainder itself.
     pub fn is_kernel_parsable(&self) -> bool {
-        self.0
-            .iter()
-            .all(|c| c.enforcement() != CheckConstraintEnforcement::Connector)
+        self.0.iter().all(|c| !c.is_connector_enforced())
     }
 
     /// The constraints kernel could not parse, whose [`raw_sql`](CheckConstraint::raw_sql) the
     /// connector must evaluate itself before writing (or fail the write). Empty when
     /// [`is_kernel_parsable`](Self::is_kernel_parsable) is true.
     pub fn connector_enforced(&self) -> impl Iterator<Item = &CheckConstraint> {
-        self.0
-            .iter()
-            .filter(|c| c.enforcement() == CheckConstraintEnforcement::Connector)
+        self.0.iter().filter(|c| c.is_connector_enforced())
     }
 
-    /// Binds the kernel-evaluable constraints to `evaluation_handler` for per-batch validation;
-    /// equivalent to [`CheckConstraintValidator::try_new`]. Fails closed if any constraint is
-    /// connector-enforced, or depends on partition values (the
-    /// [`PartitionValues`](CheckConstraintEnforcement::PartitionValues) and
-    /// [`DataAndPartitionValues`](CheckConstraintEnforcement::DataAndPartitionValues) kinds) --
-    /// those need a write context, so build one via `WriteContext::check_constraint_validator`
-    /// instead. Check [`is_kernel_parsable`](Self::is_kernel_parsable) first and handle the
-    /// [`connector_enforced`](Self::connector_enforced) remainder to avoid the connector error.
+    /// Binds every parsable constraint to `evaluation_handler` for batch validation (equivalent to
+    /// [`CheckConstraintValidator::try_new`]). Fails closed if any constraint is
+    /// connector-enforced; check [`is_kernel_parsable`](Self::is_kernel_parsable) first and
+    /// handle the [`connector_enforced`](Self::connector_enforced) remainder to avoid that
+    /// error.
     pub fn validator(
         &self,
         evaluation_handler: &dyn EvaluationHandler,
@@ -211,95 +135,13 @@ impl std::ops::Deref for CheckConstraints {
     }
 }
 
-/// Validates the (normalized, schema-cased) logical partition values of a write context against
-/// every partition-value-enforced constraint. Kernel evaluates these directly -- partition
-/// values are per-file constants, so no engine is needed. Constraints with other enforcement
-/// kinds are skipped (data-batch constraints are validated per batch; connector-enforced
-/// constraints fail closed when a validator is built).
-fn enforce_on_partition_values(
-    constraints: &[CheckConstraint],
-    partition_values: &HashMap<String, Scalar>,
-) -> DeltaResult<()> {
-    let resolver: HashMap<ColumnName, Scalar> = partition_values
-        .iter()
-        .map(|(name, value)| (ColumnName::new([name]), value.clone()))
-        .collect();
-    let evaluator = DefaultKernelPredicateEvaluator::from(resolver);
-    for constraint in constraints {
-        let ConstraintSupport::PartitionValues { predicate, .. } = &constraint.support else {
-            continue;
-        };
-        let result = evaluator.eval(predicate);
-        if result != Some(true) {
-            // Report the referenced partition values alongside the verdict (mirrors
-            // Delta-Spark's violation messages, which list the violating values).
-            let mut referenced: Vec<String> = predicate
-                .references()
-                .into_iter()
-                .filter_map(|column| {
-                    let top_level = column.path().first()?;
-                    let value = partition_values.get(top_level)?;
-                    Some(format!("{top_level} = {value}"))
-                })
-                .collect();
-            referenced.sort();
-            return Err(Error::CheckConstraintViolation {
-                name: constraint.name.clone(),
-                expression: constraint.raw_sql.clone(),
-                details: format!(
-                    "the write context's partition values ({}) evaluated to {}",
-                    referenced.join(", "),
-                    match result {
-                        Some(_) => "false",
-                        None => "NULL",
-                    },
-                ),
-            });
-        }
-    }
-    Ok(())
-}
-
-/// Where a CHECK constraint is enforced.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CheckConstraintEnforcement {
-    /// Kernel evaluates the constraint against every data batch, via a
-    /// [`CheckConstraintValidator`] (the default engine does this automatically in
-    /// `write_parquet`).
-    DataBatches,
-    /// The constraint references a partition column, so kernel evaluates it against the write
-    /// context's partition values (per-file constants; readers reconstruct partition columns from
-    /// `add.partitionValues`) -- once, when a validator is built from a partitioned write context
-    /// (e.g. the default engine's `write_parquet`). Connectors that do not build kernel validators
-    /// must enforce the constraint against their own partition values.
-    PartitionValues,
-    /// The constraint references both partition and data columns. Kernel evaluates it per data
-    /// batch via a [`CheckConstraintValidator`], but only one built from a partitioned write
-    /// context (`WriteContext::check_constraint_validator`): the write context supplies the
-    /// partition values kernel overlays onto each batch. The per-constraint
-    /// [`CheckConstraint::validate`], and a validator built without partition values, fail closed.
-    DataAndPartitionValues,
-    /// Kernel cannot evaluate the constraint; the connector must enforce the raw SQL with its
-    /// own SQL engine or fail the write.
-    Connector,
-}
-
-/// Whether (and where) kernel can evaluate a constraint's expression.
+/// Whether kernel can evaluate a constraint's expression.
 #[derive(Debug, Clone)]
 enum ConstraintSupport {
-    /// Kernel parsed the expression and evaluates it against data batches.
-    DataBatches(PredicateRef),
-    /// The expression references the named partition column; kernel evaluates it against the
-    /// partition values of each partitioned write context.
-    PartitionValues {
-        predicate: PredicateRef,
-        column: String,
-    },
-    /// The expression references BOTH partition and data columns. Kernel evaluates it per data
-    /// batch with the partition columns overlaid as their (per-file constant) write-context scalar
-    /// values, so it can only be enforced through a partitioned write context (which supplies
-    /// them).
-    DataAndPartition(PredicateRef),
+    /// Kernel parsed the expression into a predicate it evaluates against each data batch. The
+    /// batch carries every referenced column -- including partition columns, which the connector
+    /// validates before partitioning, while they are still ordinary per-row data.
+    Parsable(PredicateRef),
     /// The expression is outside the subset kernel's constraint parser supports; the payload is
     /// the parser's reason (e.g. an unresolved column vs. unsupported grammar).
     Unsupported(String),
@@ -322,47 +164,14 @@ impl CheckConstraint {
         name: impl Into<String>,
         raw_sql: impl Into<String>,
         schema: SchemaRef,
-        partition_columns: &[String],
     ) -> Self {
         let raw_sql = raw_sql.into();
+        // Kernel evaluates a parsed constraint as a plain predicate over each data batch. Partition
+        // columns need no special handling: the connector validates before partitioning, so they
+        // are present in the batch as ordinary per-row data.
         let support = match parse_sql_simple_predicate(&raw_sql, &schema) {
+            Ok(predicate) => ConstraintSupport::Parsable(Arc::new(predicate)),
             Err(reason) => ConstraintSupport::Unsupported(reason.to_string()),
-            Ok(predicate) => {
-                // Classify by which columns the predicate references. The lowered predicate uses
-                // canonical (schema-cased) column names, and metadata partition columns are
-                // schema-cased too; compare case-insensitively anyway to be robust against
-                // non-canonical metadata.
-                let references = predicate.references();
-                let is_partition = |column: &ColumnName| {
-                    column.path().first().is_some_and(|top_level| {
-                        partition_columns
-                            .iter()
-                            .any(|pc| pc.eq_ignore_ascii_case(top_level))
-                    })
-                };
-                let partition_column = references.iter().find(|c| is_partition(c)).map(|column| {
-                    // Render with the metadata-cased partition column name.
-                    let top_level = &column.path()[0];
-                    partition_columns
-                        .iter()
-                        .find(|pc| pc.eq_ignore_ascii_case(top_level))
-                        .cloned()
-                        .unwrap_or_else(|| top_level.clone())
-                });
-                let references_data_column = references.iter().any(|c| !is_partition(c));
-                let predicate = Arc::new(predicate);
-                match partition_column {
-                    // References BOTH a partition column and a data column. No single source sees
-                    // all the columns, so kernel evaluates it per data batch with the partition
-                    // columns overlaid as their (per-file constant) write-context scalar values --
-                    // which requires a partitioned write context to supply them.
-                    Some(_) if references_data_column => {
-                        ConstraintSupport::DataAndPartition(predicate)
-                    }
-                    Some(column) => ConstraintSupport::PartitionValues { predicate, column },
-                    None => ConstraintSupport::DataBatches(predicate),
-                }
-            }
         };
         Self {
             name: name.into(),
@@ -382,28 +191,18 @@ impl CheckConstraint {
         &self.raw_sql
     }
 
-    /// Where this constraint is enforced; see [`CheckConstraintEnforcement`].
-    pub fn enforcement(&self) -> CheckConstraintEnforcement {
-        match &self.support {
-            ConstraintSupport::DataBatches(_) => CheckConstraintEnforcement::DataBatches,
-            ConstraintSupport::PartitionValues { .. } => {
-                CheckConstraintEnforcement::PartitionValues
-            }
-            ConstraintSupport::DataAndPartition(_) => {
-                CheckConstraintEnforcement::DataAndPartitionValues
-            }
-            ConstraintSupport::Unsupported(_) => CheckConstraintEnforcement::Connector,
-        }
+    /// Whether kernel could not parse this constraint, so a connector must enforce its raw SQL.
+    /// Equivalent to [`Self::predicate`] being `None`; centralizes the connector-enforced test the
+    /// set-level [`CheckConstraints`] helpers use.
+    fn is_connector_enforced(&self) -> bool {
+        matches!(self.support, ConstraintSupport::Unsupported(_))
     }
 
-    /// The parsed kernel predicate, when kernel could parse the expression (the
-    /// [`DataBatches`](CheckConstraintEnforcement::DataBatches) and
-    /// [`PartitionValues`](CheckConstraintEnforcement::PartitionValues) enforcement kinds).
-    pub fn predicate(&self) -> Option<&PredicateRef> {
+    /// The parsed kernel predicate, or `None` when kernel could not parse the expression (the
+    /// connector-enforced case). Present for every constraint kernel can enforce.
+    pub fn predicate(&self) -> Option<&Predicate> {
         match &self.support {
-            ConstraintSupport::DataBatches(predicate) => Some(predicate),
-            ConstraintSupport::PartitionValues { predicate, .. } => Some(predicate),
-            ConstraintSupport::DataAndPartition(predicate) => Some(predicate),
+            ConstraintSupport::Parsable(predicate) => Some(predicate),
             ConstraintSupport::Unsupported(_) => None,
         }
     }
@@ -414,9 +213,8 @@ impl CheckConstraint {
     ///
     /// # Errors
     ///
-    /// - The constraint is not batch-enforced: partition-value-enforced constraints are checked
-    ///   against the write context's partition values (build a validator from it), not against
-    ///   batches, and connector-enforced constraints fail closed (see [`Self::enforcement`]).
+    /// - The constraint is connector-enforced (kernel could not parse it, so [`Self::predicate`] is
+    ///   `None`): validation fails closed.
     /// - [`Error::CheckConstraintViolation`] if any row evaluates to `false` or `NULL` (the
     ///   protocol counts both as violations).
     /// - The engine fails to evaluate the predicate.
@@ -425,42 +223,18 @@ impl CheckConstraint {
         batch: &dyn EngineData,
         evaluation_handler: &dyn EvaluationHandler,
     ) -> DeltaResult<()> {
-        if let ConstraintSupport::PartitionValues { column, .. } = &self.support {
-            return Err(Error::unsupported(format!(
-                "CHECK constraint '{}' ({}) references partition column '{}' and is enforced \
-                 against the write context's partition values when a validator is built from it \
-                 (e.g. WriteContext::check_constraint_validator / validate_check_constraints), not \
-                 against data batches passed here",
-                self.name, self.raw_sql, column
-            )));
-        }
         CheckConstraintValidator::try_new(std::slice::from_ref(self), evaluation_handler)?
             .validate(batch)
     }
 
-    /// The fail-closed error for constraints kernel cannot evaluate at all.
-    fn connector_enforced_error(&self) -> Error {
-        let reason = match &self.support {
-            ConstraintSupport::Unsupported(reason) => reason.as_str(),
-            _ => "constraint is kernel-evaluable",
-        };
+    /// The fail-closed error for a constraint kernel could not parse; the connector must enforce
+    /// its raw SQL with its own engine. `reason` is the parser's explanation, preserved from
+    /// [`ConstraintSupport::Unsupported`].
+    fn connector_enforced_error(&self, reason: &str) -> Error {
         Error::unsupported(format!(
             "CHECK constraint '{}' ({}) cannot be evaluated by kernel ({}); the connector must \
              enforce it with its own SQL engine before writing",
             self.name, self.raw_sql, reason
-        ))
-    }
-
-    /// The fail-closed error for a constraint that depends on partition values when no partitioned
-    /// write context (hence no partition values) is available to evaluate it against. Covers both
-    /// partition-only ([`ConstraintSupport::PartitionValues`]) and mixed
-    /// ([`ConstraintSupport::DataAndPartition`]) constraints.
-    fn partition_context_required_error(&self) -> Error {
-        Error::unsupported(format!(
-            "CHECK constraint '{}' ({}) depends on partition values; it can only be evaluated \
-             through a partitioned write context (e.g. WriteContext::check_constraint_validator / \
-             validate_check_constraints), which supplies them",
-            self.name, self.raw_sql
         ))
     }
 }
@@ -550,122 +324,53 @@ impl ViolationValuesRenderer {
     }
 }
 
-/// A constraint's predicate evaluator, bound once via [`CheckConstraintValidator::try_new`].
+/// A constraint's predicate evaluator, bound once via [`CheckConstraintValidator::try_new`]. The
+/// partition-value overlay (if any) is shared across constraints and lives on the validator, not
+/// here.
 struct BoundConstraint {
     name: String,
     raw_sql: String,
     evaluator: Arc<dyn PredicateEvaluator>,
-    /// For [`ConstraintSupport::DataAndPartition`]: overlays the partition columns onto each batch
-    /// (as their write-context scalar values) before `evaluator` runs. `None` for a plain
-    /// data-batch constraint, which evaluates directly over the batch.
-    augment: Option<Arc<dyn ExpressionEvaluator>>,
     values_renderer: Option<ViolationValuesRenderer>,
 }
 
-/// The table's kernel-evaluable CHECK constraints bound to an engine's [`EvaluationHandler`],
-/// ready to validate batches. Build it once per write and reuse it for every batch: construction
-/// surfaces connector-enforced constraints immediately (fail closed, before any data is written)
-/// and amortizes predicate-evaluator creation across batches.
+/// The table's kernel-parsable CHECK constraints bound to an engine's [`EvaluationHandler`], ready
+/// to validate batches. Build it once and reuse it for every batch: construction surfaces
+/// connector-enforced constraints immediately (fail closed, before any data is written) and
+/// amortizes predicate-evaluator creation across batches.
 ///
-/// Partition-value-enforced constraints are evaluated once at construction, against the write
-/// context's partition values; a validator built without them (the bare [`Self::try_new`]) fails
-/// closed on them. Connectors that do not build kernel validators must enforce such constraints
-/// against their own partition values.
+/// Every bound constraint is a plain predicate over a data batch. Because the connector validates
+/// before partitioning, partition columns are present in the batch as ordinary per-row data, so
+/// they need no special handling here.
 ///
-/// Custom engines obtain one from `WriteContext::check_constraint_validator`, or directly from
-/// the constraints returned by `Transaction::check_constraints`.
+/// Obtain one from [`CheckConstraints::validator`] (the set returned by
+/// `Transaction::check_constraints` or `Snapshot::check_constraints`).
 pub struct CheckConstraintValidator {
     bound: Vec<BoundConstraint>,
 }
 
-/// Builds an expression evaluator that overlays a write context's partition columns onto a logical
-/// batch: each partition column is replaced by its (per-file constant) scalar value, every other
-/// column passes through unchanged. This lets a predicate referencing both partition and data
-/// columns evaluate over a single batch -- against the value kernel records in
-/// `add.partitionValues` (the authoritative one), not whatever a batch might carry for the
-/// partition column.
-fn build_partition_augment(
-    schema: &SchemaRef,
-    partition_values: &HashMap<String, Scalar>,
-    evaluation_handler: &dyn EvaluationHandler,
-) -> DeltaResult<Arc<dyn ExpressionEvaluator>> {
-    let fields: Vec<Expression> = schema
-        .fields()
-        .map(|field| match partition_values.get(field.name()) {
-            Some(scalar) => Expression::literal(scalar.clone()),
-            None => Expression::column([field.name()]),
-        })
-        .collect();
-    evaluation_handler.new_expression_evaluator(
-        schema.clone(),
-        Arc::new(Expression::struct_from(fields)),
-        DataType::from(schema.as_ref().clone()),
-    )
-}
-
 impl CheckConstraintValidator {
-    /// Binds `constraints` to `evaluation_handler`, erroring (fail closed) if any constraint is
-    /// connector-enforced, or depends on partition values (the partition-only and partition+data
-    /// kinds need a write context's partition values, which this constructor does not supply). A
-    /// connector that enforces such constraints with its own SQL engine should filter them out and
-    /// bind only the remainder.
+    /// Binds each parsable constraint's predicate to `evaluation_handler`, erroring (fail closed)
+    /// on the first connector-enforced constraint. A connector that enforces those with its own
+    /// SQL engine should filter them out (via [`CheckConstraints::connector_enforced`]) and bind
+    /// only the remainder.
     pub fn try_new(
         constraints: &[CheckConstraint],
         evaluation_handler: &dyn EvaluationHandler,
     ) -> DeltaResult<Self> {
-        Self::try_new_for_write_context(constraints, &HashMap::new(), evaluation_handler)
-    }
-
-    /// Like [`Self::try_new`], but supplied with the (logical, schema-cased) partition values of a
-    /// write context. A constraint referencing both partition and data columns
-    /// ([`ConstraintSupport::DataAndPartition`]) is bound by overlaying those partition values onto
-    /// each batch; given an empty map (no write context), such a constraint fails closed.
-    pub(crate) fn try_new_for_write_context(
-        constraints: &[CheckConstraint],
-        partition_values: &HashMap<String, Scalar>,
-        evaluation_handler: &dyn EvaluationHandler,
-    ) -> DeltaResult<Self> {
-        // Partition-only constraints need no data batch: enforce them here, once, against the
-        // write context's partition values (the per-batch loop below skips them). With a write
-        // context (non-empty map) this is the partition-value enforcement point; without one, the
-        // loop fails them closed, mirroring DataAndPartition.
-        if !partition_values.is_empty() {
-            enforce_on_partition_values(constraints, partition_values)?;
-        }
-        let mut bound = Vec::new();
+        let mut bound = Vec::with_capacity(constraints.len());
         for constraint in constraints {
-            let (predicate, augment) = match &constraint.support {
-                ConstraintSupport::DataBatches(predicate) => (predicate, None),
-                ConstraintSupport::DataAndPartition(predicate) => {
-                    if partition_values.is_empty() {
-                        return Err(constraint.partition_context_required_error());
-                    }
-                    let augment = build_partition_augment(
-                        &constraint.schema,
-                        partition_values,
-                        evaluation_handler,
-                    )?;
-                    (predicate, Some(augment))
-                }
-                // Enforced above (once) against the write context's partition values, not per
-                // batch. Without a write context (empty map), kernel cannot evaluate it -> fail
-                // closed, mirroring DataAndPartition.
-                ConstraintSupport::PartitionValues { .. } => {
-                    if partition_values.is_empty() {
-                        return Err(constraint.partition_context_required_error());
-                    }
-                    continue;
-                }
-                ConstraintSupport::Unsupported(_) => {
-                    return Err(constraint.connector_enforced_error())
-                }
+            let ConstraintSupport::Parsable(predicate) = &constraint.support else {
+                let ConstraintSupport::Unsupported(reason) = &constraint.support else {
+                    unreachable!("non-Parsable support is Unsupported");
+                };
+                return Err(constraint.connector_enforced_error(reason));
             };
             bound.push(BoundConstraint {
                 name: constraint.name.clone(),
                 raw_sql: constraint.raw_sql.clone(),
                 evaluator: evaluation_handler
                     .new_predicate_evaluator(constraint.schema.clone(), predicate.clone())?,
-                augment,
                 // Rendering violating values is a best-effort nicety; never fail binding over it.
                 values_renderer: ViolationValuesRenderer::try_new(
                     &constraint.schema,
@@ -678,9 +383,10 @@ impl CheckConstraintValidator {
         Ok(Self { bound })
     }
 
-    /// Validates that every row of `batch` satisfies every bound constraint. `batch` must use
-    /// the table's logical schema (the schema `WriteContext::logical_schema` reports, before any
-    /// logical-to-physical transform), since constraints reference logical column names.
+    /// Validates that every row of `batch` satisfies every bound constraint. `batch` must use the
+    /// table's logical schema, before any logical-to-physical transform, since constraints
+    /// reference logical column names -- and it must still carry partition columns (the connector
+    /// validates before partitioning drops them).
     ///
     /// # Errors
     ///
@@ -688,16 +394,7 @@ impl CheckConstraintValidator {
     /// exactly `true` (`false` and `NULL` are both violations), or any engine evaluation error.
     pub fn validate(&self, batch: &dyn EngineData) -> DeltaResult<()> {
         for constraint in &self.bound {
-            // Partition+data constraints overlay the partition scalars onto the batch first, so
-            // the predicate (and the value renderer) see the authoritative partition value on
-            // every row. Plain data-batch constraints evaluate directly over `batch`.
-            let augmented = match &constraint.augment {
-                Some(augment) => Some(augment.evaluate(batch)?),
-                None => None,
-            };
-            let input: &dyn EngineData = augmented.as_deref().unwrap_or(batch);
-
-            let result = constraint.evaluator.evaluate(input)?;
+            let result = constraint.evaluator.evaluate(batch)?;
             let mut visitor = CheckResultVisitor::default();
             visitor.visit_rows_of(result.as_ref())?;
             let Some(violation) = visitor.violation else {
@@ -706,7 +403,7 @@ impl CheckConstraintValidator {
             let values = constraint
                 .values_renderer
                 .as_ref()
-                .and_then(|renderer| renderer.render(input, violation.row))
+                .and_then(|renderer| renderer.render(batch, violation.row))
                 .map(|json| format!("; values: {json}"))
                 .unwrap_or_default();
             return Err(Error::CheckConstraintViolation {
@@ -827,82 +524,6 @@ mod tests {
     }
 
     #[test]
-    fn fingerprint_tracks_constraints_schema_and_partition_columns() {
-        let pc = vec!["name".to_string()];
-        let base = CheckConstraintFingerprint::new(
-            &config(&[("delta.constraints.c", "amount > 0")]),
-            schema(),
-            &pc,
-        );
-        // Identical inputs -> equal (a fast retry is sound).
-        assert_eq!(
-            base,
-            CheckConstraintFingerprint::new(
-                &config(&[("delta.constraints.c", "amount > 0")]),
-                schema(),
-                &pc,
-            )
-        );
-        // An unrelated table-property change is excluded -> still equal (no needless
-        // re-validation).
-        assert_eq!(
-            base,
-            CheckConstraintFingerprint::new(
-                &config(&[
-                    ("delta.constraints.c", "amount > 0"),
-                    ("delta.appendOnly", "true")
-                ]),
-                schema(),
-                &pc,
-            )
-        );
-        // Changed SQL -> differ.
-        assert_ne!(
-            base,
-            CheckConstraintFingerprint::new(
-                &config(&[("delta.constraints.c", "amount > 5")]),
-                schema(),
-                &pc,
-            )
-        );
-        // Added constraint -> differ.
-        assert_ne!(
-            base,
-            CheckConstraintFingerprint::new(
-                &config(&[
-                    ("delta.constraints.c", "amount > 0"),
-                    ("delta.constraints.d", "amount < 100"),
-                ]),
-                schema(),
-                &pc,
-            )
-        );
-        // Changed partition columns -> differ (data-only vs partition-only vs mixed
-        // classification).
-        assert_ne!(
-            base,
-            CheckConstraintFingerprint::new(
-                &config(&[("delta.constraints.c", "amount > 0")]),
-                schema(),
-                &[]
-            )
-        );
-        // Changed schema (amount LONG -> INTEGER) -> differ (parsing/coercion can change).
-        let retyped = Arc::new(StructType::new_unchecked([
-            StructField::nullable("amount", DataType::INTEGER),
-            StructField::nullable("name", DataType::STRING),
-        ]));
-        assert_ne!(
-            base,
-            CheckConstraintFingerprint::new(
-                &config(&[("delta.constraints.c", "amount > 0")]),
-                retyped,
-                &pc
-            )
-        );
-    }
-
-    #[test]
     fn constraint_prefix_matches_case_insensitively() {
         // Delta-Spark discovers the prefix case-insensitively; kernel must not ignore a
         // constraint other writers enforce.
@@ -917,7 +538,7 @@ mod tests {
         ] {
             let config = config(&[(key, "amount > 0")]);
             assert!(has_check_constraints(&config), "prefix of {key} matches");
-            let constraints = constraints_from_configuration(&config, schema(), &[]);
+            let constraints = constraints_from_configuration(&config, schema());
             assert_eq!(constraints.len(), 1, "constraint under {key} discovered");
             assert_eq!(constraints[0].name(), "positive");
         }
@@ -925,14 +546,14 @@ mod tests {
 
     #[test]
     fn collection_answers_the_set_level_parsable_question() {
-        // All parsable (including a partition-column constraint, which kernel also enforces).
+        // All parsable (a data-column and a partition-column constraint alike -- both are just
+        // predicates over the batch).
         let all_parsable = constraints_from_configuration(
             &config(&[
                 ("delta.constraints.positive", "amount > 0"),
                 ("delta.constraints.name_check", "name = 'a'"),
             ]),
             schema(),
-            &["name".to_string()],
         );
         assert!(all_parsable.is_kernel_parsable());
         assert_eq!(all_parsable.connector_enforced().count(), 0);
@@ -945,7 +566,6 @@ mod tests {
                 ("delta.constraints.range", "amount > 0 AND amount < 100"),
             ]),
             schema(),
-            &[],
         );
         assert!(!mixed.is_kernel_parsable());
         let raw: Vec<_> = mixed
@@ -955,7 +575,7 @@ mod tests {
         assert_eq!(raw, [("range", "amount > 0 AND amount < 100")]);
 
         // No constraints: trivially parsable.
-        assert!(constraints_from_configuration(&config(&[]), schema(), &[]).is_kernel_parsable());
+        assert!(constraints_from_configuration(&config(&[]), schema()).is_kernel_parsable());
     }
 
     #[test]
@@ -965,12 +585,12 @@ mod tests {
             ("delta.constraints.a_check", "amount > 0"),
             ("delta.appendOnly", "true"),
         ]);
-        let constraints = constraints_from_configuration(&config, schema(), &[]);
+        let constraints = constraints_from_configuration(&config, schema());
         let names: Vec<_> = constraints.iter().map(|c| c.name()).collect();
         assert_eq!(names, ["a_check", "b_check"]);
         assert!(constraints
             .iter()
-            .all(|c| c.enforcement() == CheckConstraintEnforcement::DataBatches));
+            .all(|c| matches!(c.support, ConstraintSupport::Parsable(_))));
         assert_eq!(constraints[0].raw_sql(), "amount > 0");
     }
 
@@ -978,30 +598,30 @@ mod tests {
     fn token_spaced_and_parenthesized_expressions_are_evaluable() {
         // Delta-Spark stores parser-round-tripped, token-spaced expression text (e.g.
         // `concat ( num , text ) != '9i'`); simple comparisons must tolerate the same style.
-        let constraint = CheckConstraint::new("p", "( amount > 0 )", schema(), &[]);
-        assert_eq!(
-            constraint.enforcement(),
-            CheckConstraintEnforcement::DataBatches
-        );
+        let constraint = CheckConstraint::new("p", "( amount > 0 )", schema());
+        assert!(matches!(constraint.support, ConstraintSupport::Parsable(_)));
     }
 
     #[test]
     fn connector_enforced_errors_preserve_the_parser_reason() {
         // Unsupported grammar and unresolvable columns are different failure modes (Delta-Spark
         // raises distinct error classes); the fail-closed error must say which one applies.
-        let junction = CheckConstraint::new("range", "amount > 0 AND amount < 100", schema(), &[]);
-        assert_eq!(
-            junction.enforcement(),
-            CheckConstraintEnforcement::Connector
-        );
-        let msg = junction.connector_enforced_error().to_string();
+        let error_for = |c: &CheckConstraint| {
+            let ConstraintSupport::Unsupported(reason) = &c.support else {
+                panic!("expected Unsupported");
+            };
+            c.connector_enforced_error(reason).to_string()
+        };
+
+        let junction = CheckConstraint::new("range", "amount > 0 AND amount < 100", schema());
+        let msg = error_for(&junction);
         assert!(
             msg.contains("only simple comparison"),
             "junction reason surfaces: {msg}"
         );
 
-        let unknown_column = CheckConstraint::new("ghost", "nope > 0", schema(), &[]);
-        let msg = unknown_column.connector_enforced_error().to_string();
+        let unknown_column = CheckConstraint::new("ghost", "nope > 0", schema());
+        let msg = error_for(&unknown_column);
         assert!(
             msg.contains("not found in schema"),
             "unresolved-column reason surfaces: {msg}"
@@ -1011,10 +631,9 @@ mod tests {
     #[test]
     fn functions_and_null_checks_are_connector_enforced() {
         for sql in ["length(name) > 0", "amount IS NOT NULL"] {
-            let constraint = CheckConstraint::new("c", sql, schema(), &[]);
-            assert_eq!(
-                constraint.enforcement(),
-                CheckConstraintEnforcement::Connector,
+            let constraint = CheckConstraint::new("c", sql, schema());
+            assert!(
+                matches!(constraint.support, ConstraintSupport::Unsupported(_)),
                 "expected '{sql}' to be connector-enforced"
             );
             assert!(constraint.predicate().is_none());
@@ -1023,97 +642,24 @@ mod tests {
     }
 
     #[test]
-    fn partition_column_constraints_are_partition_value_enforced() {
-        let partition_columns = vec!["name".to_string()];
-        // References the partition column (even with different casing).
-        let on_partition = CheckConstraint::new("part", "NAME = 'a'", schema(), &partition_columns);
-        assert_eq!(
-            on_partition.enforcement(),
-            CheckConstraintEnforcement::PartitionValues
-        );
-        assert!(on_partition.predicate().is_some());
+    fn partition_and_mixed_column_constraints_parse_like_any_other() {
+        // Partition membership no longer affects classification: the connector validates before
+        // partitioning, so a partition column is ordinary batch data. A constraint on a partition
+        // column (`name`), on a data column (`amount`), and one mixing both all parse.
+        for sql in ["name = 'a'", "amount > 0", "name != amount"] {
+            let c = CheckConstraint::new("c", sql, schema());
+            assert!(
+                matches!(c.support, ConstraintSupport::Parsable(_)),
+                "'{sql}' should parse"
+            );
+            assert!(c.predicate().is_some());
+        }
 
-        // A data-column constraint on the same partitioned table stays batch-enforced.
-        let on_data = CheckConstraint::new("data", "amount > 0", schema(), &partition_columns);
-        assert_eq!(
-            on_data.enforcement(),
-            CheckConstraintEnforcement::DataBatches
-        );
-    }
-
-    #[test]
-    fn single_comparison_mixing_partition_and_data_columns_is_partition_augmented() {
-        let partition_columns = vec!["name".to_string()];
-        // A single comparison referencing both the partition column (`name`) and a data column
-        // (`amount`): kernel evaluates it per batch with the partition value overlaid, so it is
-        // partition-augmented (kernel-parsable) rather than connector-enforced.
-        let mixed = CheckConstraint::new("mixed", "name != amount", schema(), &partition_columns);
-        assert_eq!(
-            mixed.enforcement(),
-            CheckConstraintEnforcement::DataAndPartitionValues
-        );
-        assert!(mixed.predicate().is_some());
-
-        // A junction is still outside the simple-comparison grammar, so it is connector-enforced
-        // even though it also mixes a partition and a data column.
-        let junction = CheckConstraint::new(
-            "junction",
-            "name = 'a' AND amount > 0",
-            schema(),
-            &partition_columns,
-        );
-        assert_eq!(
-            junction.enforcement(),
-            CheckConstraintEnforcement::Connector
-        );
-
-        // With only the partition-augmented mixed constraint, the table is fully kernel-parsable.
-        let constraints = constraints_from_configuration(
-            &config(&[("delta.constraints.mixed", "name != amount")]),
-            schema(),
-            &partition_columns,
-        );
-        assert!(constraints.is_kernel_parsable());
-        assert_eq!(constraints.connector_enforced().count(), 0);
-    }
-
-    #[test]
-    fn enforce_on_partition_values_requires_true() {
-        let partition_columns = vec!["name".to_string()];
-        let constraints = constraints_from_configuration(
-            &config(&[
-                ("delta.constraints.name_check", "name = 'a'"),
-                ("delta.constraints.positive_amount", "amount > 0"),
-            ]),
-            schema(),
-            &partition_columns,
-        );
-        let values = |name: Scalar| HashMap::from([("name".to_string(), name)]);
-
-        // Satisfying partition values pass; the data-batch constraint is skipped even though
-        // `amount` is not a partition value.
-        enforce_on_partition_values(&constraints, &values(Scalar::from("a"))).unwrap();
-
-        // A false result is a violation, and the details report the offending values.
-        let err = enforce_on_partition_values(&constraints, &values(Scalar::from("b")))
-            .expect_err("non-matching partition value must violate");
-        let Error::CheckConstraintViolation { name, details, .. } = err else {
-            panic!("expected CheckConstraintViolation, got: {err:?}");
-        };
-        assert_eq!(name, "name_check");
-        assert!(details.contains("false"), "details report false: {details}");
-        assert!(
-            details.contains("name = "),
-            "details include the partition value: {details}"
-        );
-
-        // A NULL partition value is also a violation (only `true` passes).
-        let err =
-            enforce_on_partition_values(&constraints, &values(Scalar::Null(DataType::STRING)))
-                .expect_err("NULL partition value must violate");
-        let Error::CheckConstraintViolation { details, .. } = err else {
-            panic!("expected CheckConstraintViolation, got: {err:?}");
-        };
-        assert!(details.contains("NULL"), "details report NULL: {details}");
+        // A junction is still outside the simple-comparison grammar -> connector-enforced.
+        let junction = CheckConstraint::new("junction", "name = 'a' AND amount > 0", schema());
+        assert!(matches!(
+            junction.support,
+            ConstraintSupport::Unsupported(_)
+        ));
     }
 }
