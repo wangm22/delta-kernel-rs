@@ -346,8 +346,8 @@ impl Snapshot {
         self.parsed_check_constraints
             .get_or_init(|| {
                 let table_config = self.table_configuration();
-                crate::check_constraints::constraints_from_configuration(
-                    table_config.metadata().configuration(),
+                crate::check_constraints::constraints_from_properties(
+                    &table_config.table_properties().check_constraints,
                     table_config.logical_schema(),
                 )
             })
@@ -2354,13 +2354,19 @@ mod tests {
 
         let constraints = snapshot.check_constraints();
         assert_eq!(constraints.len(), 2);
-        // Discovered sorted by name; `positive` parses, `range` (a junction) is connector-enforced.
+        // Discovered sorted by name; `positive` parses, `range` (a junction) has no predicate.
         assert_eq!(constraints[0].name(), "positive");
         assert!(constraints[0].predicate().is_some());
         assert_eq!(constraints[1].name(), "range");
         assert!(constraints[1].predicate().is_none());
         assert!(!constraints.is_kernel_parsable());
-        assert_eq!(constraints.connector_enforced().count(), 1);
+        assert_eq!(
+            constraints
+                .iter()
+                .filter(|c| c.predicate().is_none())
+                .count(),
+            1
+        );
 
         // Repeated calls return the cached (equal) set.
         let again = snapshot.check_constraints();

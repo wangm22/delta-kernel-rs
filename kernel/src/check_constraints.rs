@@ -24,10 +24,17 @@
 //!   determines the partition, hence what readers reconstruct from `add.partitionValues`.
 //!   Enforcement is not wired into `write_parquet` or any write-context step; the connector runs
 //!   the validator itself, before it partitions or writes.
-//! - A constraint kernel cannot parse ([`CheckConstraint::predicate`] is `None`, surfaced by
-//!   [`CheckConstraints::connector_enforced`]) -- currently anything beyond a single
-//!   column-vs-literal comparison like `col1 < 10` -- must be enforced by the connector's own SQL
-//!   engine; kernel-driven validation fails closed.
+//! - A constraint kernel cannot parse ([`CheckConstraint::predicate`] is `None`) -- currently
+//!   anything beyond a single column-vs-literal comparison like `col1 < 10` -- exposes only its
+//!   [`raw_sql`](CheckConstraint::raw_sql), which the connector's own SQL engine must enforce;
+//!   kernel-driven validation fails closed on it.
+//!
+//! Kernel does not enumerate *which* constraints a connector must enforce -- that is the
+//! connector's decision. It reports, per constraint, the parsed
+//! [`predicate`](CheckConstraint::predicate) (when present) and the always-available
+//! [`raw_sql`](CheckConstraint::raw_sql), plus the
+//! set-level [`CheckConstraints::is_kernel_parsable`] rollup; the connector iterates and branches
+//! on `predicate().is_some()`.
 
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
@@ -44,41 +51,21 @@ use crate::{
     PredicateRef,
 };
 
-/// Table-configuration key prefix under which CHECK constraints are stored.
-pub(crate) const CHECK_CONSTRAINT_PREFIX: &str = "delta.constraints.";
-
-/// Returns the constraint name if `key` is a CHECK-constraint configuration key. Delta-Spark
-/// matches the `delta.constraints.` prefix case-insensitively when discovering constraints, so
-/// kernel must too -- otherwise kernel could ignore (and write past) a constraint other writers
-/// enforce.
-fn strip_constraint_prefix(key: &str) -> Option<&str> {
-    let prefix = key.get(..CHECK_CONSTRAINT_PREFIX.len())?;
-    prefix
-        .eq_ignore_ascii_case(CHECK_CONSTRAINT_PREFIX)
-        .then(|| &key[CHECK_CONSTRAINT_PREFIX.len()..])
-}
-
-/// Returns true if the table configuration contains any CHECK constraints.
-pub(crate) fn has_check_constraints(configuration: &HashMap<String, String>) -> bool {
-    configuration
-        .keys()
-        .any(|key| strip_constraint_prefix(key).is_some())
-}
-
-/// Extracts all CHECK constraints from the table configuration, attempting to parse each one
-/// against `schema`. Constraints kernel cannot evaluate are still returned (with
+/// Parses all CHECK constraints declared on the table, attempting to parse each one against
+/// `schema`. `check_constraints` is the table's [`TableProperties::check_constraints`] map (name ->
+/// raw SQL); prefix stripping and case normalization already happened during table-property
+/// parsing. Constraints kernel cannot evaluate are still returned (with
 /// [`CheckConstraint::predicate`] returning `None`) so that connectors with their own SQL engine
 /// can enforce them from the raw SQL.
-pub(crate) fn constraints_from_configuration(
-    configuration: &HashMap<String, String>,
+///
+/// [`TableProperties::check_constraints`]: crate::table_properties::TableProperties::check_constraints
+pub(crate) fn constraints_from_properties(
+    check_constraints: &HashMap<String, String>,
     schema: SchemaRef,
 ) -> CheckConstraints {
-    let mut constraints: Vec<_> = configuration
+    let mut constraints: Vec<_> = check_constraints
         .iter()
-        .filter_map(|(key, sql)| {
-            let name = strip_constraint_prefix(key)?;
-            Some(CheckConstraint::new(name, sql, schema.clone()))
-        })
+        .map(|(name, sql)| CheckConstraint::new(name, sql, schema.clone()))
         .collect();
     // HashMap iteration order is unstable; sort for deterministic discovery and error ordering.
     constraints.sort_by(|a, b| a.name.cmp(&b.name));
@@ -87,38 +74,33 @@ pub(crate) fn constraints_from_configuration(
 
 /// All CHECK constraints on a table. Dereferences to a slice for per-constraint access.
 ///
-/// The first question a connector asks is set-level, so it is answered here:
-/// [`is_kernel_parsable`](Self::is_kernel_parsable) reports whether kernel parsed *every*
-/// constraint. If it did, the connector builds a [`validator`](Self::validator) and runs it over
-/// its data. If not, the connector must evaluate the remaining raw SQL itself --
-/// [`connector_enforced`](Self::connector_enforced) yields exactly those constraints -- or fail
-/// the write.
+/// Kernel does not partition the set into "kernel's" and "the connector's" constraints -- which
+/// constraints a connector evaluates is its own decision. It reports, per constraint, both the
+/// parsed [`predicate`](CheckConstraint::predicate) (when kernel could parse the expression) and
+/// the [`raw_sql`](CheckConstraint::raw_sql) (always), and answers one set-level question:
+/// [`is_kernel_parsable`](Self::is_kernel_parsable) -- did kernel parse *every* constraint? If it
+/// did, the connector can build a [`validator`](Self::validator) and let kernel evaluate all of
+/// them; otherwise it iterates the set (via `Deref`) and, per constraint, evaluates the predicate
+/// when present or self-enforces the raw SQL.
 // `Arc<[_]>` (not `Vec`) so cloning the set is an O(1) refcount bump; callers (the transaction and
 // snapshot discovery caches) hand out cheap clones of a single parse.
 #[derive(Debug, Clone, Default)]
 pub struct CheckConstraints(Arc<[CheckConstraint]>);
 
 impl CheckConstraints {
-    /// True if kernel parsed every constraint -- none require a connector to enforce them. The
-    /// connector can then build a [`validator`](Self::validator) and let kernel evaluate all of
-    /// them; otherwise it must handle the [`connector_enforced`](Self::connector_enforced)
-    /// remainder itself.
+    /// True if kernel parsed every constraint into a [`predicate`](CheckConstraint::predicate) it
+    /// can evaluate. The connector can then build a [`validator`](Self::validator) and let kernel
+    /// evaluate all of them. When false, at least one constraint exposes only its
+    /// [`raw_sql`](CheckConstraint::raw_sql), which the connector must evaluate with its own SQL
+    /// engine (or fail the write).
     pub fn is_kernel_parsable(&self) -> bool {
-        self.0.iter().all(|c| !c.is_connector_enforced())
-    }
-
-    /// The constraints kernel could not parse, whose [`raw_sql`](CheckConstraint::raw_sql) the
-    /// connector must evaluate itself before writing (or fail the write). Empty when
-    /// [`is_kernel_parsable`](Self::is_kernel_parsable) is true.
-    pub fn connector_enforced(&self) -> impl Iterator<Item = &CheckConstraint> {
-        self.0.iter().filter(|c| c.is_connector_enforced())
+        self.0.iter().all(|c| c.predicate().is_some())
     }
 
     /// Binds every parsable constraint to `evaluation_handler` for batch validation (equivalent to
-    /// [`CheckConstraintValidator::try_new`]). Fails closed if any constraint is
-    /// connector-enforced; check [`is_kernel_parsable`](Self::is_kernel_parsable) first and
-    /// handle the [`connector_enforced`](Self::connector_enforced) remainder to avoid that
-    /// error.
+    /// [`CheckConstraintValidator::try_new`]). Fails closed if any constraint is unparsable; check
+    /// [`is_kernel_parsable`](Self::is_kernel_parsable) first and self-enforce the raw SQL of any
+    /// constraint whose [`predicate`](CheckConstraint::predicate) is `None` to avoid that error.
     pub fn validator(
         &self,
         evaluation_handler: &dyn EvaluationHandler,
@@ -191,15 +173,9 @@ impl CheckConstraint {
         &self.raw_sql
     }
 
-    /// Whether kernel could not parse this constraint, so a connector must enforce its raw SQL.
-    /// Equivalent to [`Self::predicate`] being `None`; centralizes the connector-enforced test the
-    /// set-level [`CheckConstraints`] helpers use.
-    fn is_connector_enforced(&self) -> bool {
-        matches!(self.support, ConstraintSupport::Unsupported(_))
-    }
-
-    /// The parsed kernel predicate, or `None` when kernel could not parse the expression (the
-    /// connector-enforced case). Present for every constraint kernel can enforce.
+    /// The parsed kernel predicate, or `None` when kernel could not parse the expression. When
+    /// `None`, only [`Self::raw_sql`] is available and the connector must enforce it with its own
+    /// SQL engine.
     pub fn predicate(&self) -> Option<&Predicate> {
         match &self.support {
             ConstraintSupport::Parsable(predicate) => Some(predicate),
@@ -335,9 +311,9 @@ struct BoundConstraint {
 }
 
 /// The table's kernel-parsable CHECK constraints bound to an engine's [`EvaluationHandler`], ready
-/// to validate batches. Build it once and reuse it for every batch: construction surfaces
-/// connector-enforced constraints immediately (fail closed, before any data is written) and
-/// amortizes predicate-evaluator creation across batches.
+/// to validate batches. Build it once and reuse it for every batch: construction fails closed on
+/// any unparsable constraint immediately (before any data is written) and amortizes
+/// predicate-evaluator creation across batches.
 ///
 /// Every bound constraint is a plain predicate over a data batch. Because the connector validates
 /// before partitioning, partition columns are present in the batch as ordinary per-row data, so
@@ -351,9 +327,9 @@ pub struct CheckConstraintValidator {
 
 impl CheckConstraintValidator {
     /// Binds each parsable constraint's predicate to `evaluation_handler`, erroring (fail closed)
-    /// on the first connector-enforced constraint. A connector that enforces those with its own
-    /// SQL engine should filter them out (via [`CheckConstraints::connector_enforced`]) and bind
-    /// only the remainder.
+    /// on the first unparsable constraint (one whose [`CheckConstraint::predicate`] is `None`). A
+    /// connector that self-enforces those with its own SQL engine should filter them out first and
+    /// bind only the constraints that have a predicate.
     pub fn try_new(
         constraints: &[CheckConstraint],
         evaluation_handler: &dyn EvaluationHandler,
@@ -516,7 +492,9 @@ mod tests {
         ]))
     }
 
-    fn config(entries: &[(&str, &str)]) -> HashMap<String, String> {
+    // Constraints keyed by name -> raw SQL, mirroring `TableProperties::check_constraints` (the
+    // `delta.constraints.` prefix is already stripped by table-property parsing).
+    fn constraints(entries: &[(&str, &str)]) -> HashMap<String, String> {
         entries
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -524,68 +502,44 @@ mod tests {
     }
 
     #[test]
-    fn constraint_prefix_matches_case_insensitively() {
-        // Delta-Spark discovers the prefix case-insensitively; kernel must not ignore a
-        // constraint other writers enforce.
-        assert!(!has_check_constraints(&config(&[(
-            "delta.appendOnly",
-            "true"
-        )])));
-        for key in [
-            "delta.constraints.positive",
-            "DELTA.CONSTRAINTS.positive",
-            "Delta.Constraints.positive",
-        ] {
-            let config = config(&[(key, "amount > 0")]);
-            assert!(has_check_constraints(&config), "prefix of {key} matches");
-            let constraints = constraints_from_configuration(&config, schema());
-            assert_eq!(constraints.len(), 1, "constraint under {key} discovered");
-            assert_eq!(constraints[0].name(), "positive");
-        }
-    }
-
-    #[test]
-    fn collection_answers_the_set_level_parsable_question() {
+    fn set_level_parsable_reflects_per_constraint_predicates() {
         // All parsable (a data-column and a partition-column constraint alike -- both are just
-        // predicates over the batch).
-        let all_parsable = constraints_from_configuration(
-            &config(&[
-                ("delta.constraints.positive", "amount > 0"),
-                ("delta.constraints.name_check", "name = 'a'"),
-            ]),
+        // predicates over the batch). Every constraint exposes a predicate.
+        let all_parsable = constraints_from_properties(
+            &constraints(&[("positive", "amount > 0"), ("name_check", "name = 'a'")]),
             schema(),
         );
         assert!(all_parsable.is_kernel_parsable());
-        assert_eq!(all_parsable.connector_enforced().count(), 0);
+        assert!(all_parsable.iter().all(|c| c.predicate().is_some()));
 
-        // One constraint outside the supported grammar flips the set-level answer, and
-        // connector_enforced() exposes exactly that constraint's raw SQL.
-        let mixed = constraints_from_configuration(
-            &config(&[
-                ("delta.constraints.positive", "amount > 0"),
-                ("delta.constraints.range", "amount > 0 AND amount < 100"),
+        // One constraint outside the supported grammar flips the set-level answer. Kernel does not
+        // say which constraints are the connector's; the connector iterates and branches on
+        // predicate() -- the unparsable one exposes only its raw SQL.
+        let mixed = constraints_from_properties(
+            &constraints(&[
+                ("positive", "amount > 0"),
+                ("range", "amount > 0 AND amount < 100"),
             ]),
             schema(),
         );
         assert!(!mixed.is_kernel_parsable());
-        let raw: Vec<_> = mixed
-            .connector_enforced()
+        let raw_only: Vec<_> = mixed
+            .iter()
+            .filter(|c| c.predicate().is_none())
             .map(|c| (c.name(), c.raw_sql()))
             .collect();
-        assert_eq!(raw, [("range", "amount > 0 AND amount < 100")]);
+        assert_eq!(raw_only, [("range", "amount > 0 AND amount < 100")]);
 
         // No constraints: trivially parsable.
-        assert!(constraints_from_configuration(&config(&[]), schema()).is_kernel_parsable());
+        assert!(constraints_from_properties(&constraints(&[]), schema()).is_kernel_parsable());
     }
 
     #[test]
-    fn discovery_extracts_sorted_constraints_and_skips_other_keys() {
-        let config = config(&[
-            ("delta.constraints.b_check", "amount < 100"),
-            ("delta.constraints.a_check", "amount > 0"),
-            ("delta.appendOnly", "true"),
-        ]);
-        let constraints = constraints_from_configuration(&config, schema());
+    fn discovery_extracts_sorted_constraints() {
+        let constraints = constraints_from_properties(
+            &constraints(&[("b_check", "amount < 100"), ("a_check", "amount > 0")]),
+            schema(),
+        );
         let names: Vec<_> = constraints.iter().map(|c| c.name()).collect();
         assert_eq!(names, ["a_check", "b_check"]);
         assert!(constraints
@@ -629,12 +583,13 @@ mod tests {
     }
 
     #[test]
-    fn functions_and_null_checks_are_connector_enforced() {
+    fn functions_and_null_checks_expose_only_raw_sql() {
+        // Expressions kernel cannot parse have no predicate; the connector falls back to raw SQL.
         for sql in ["length(name) > 0", "amount IS NOT NULL"] {
             let constraint = CheckConstraint::new("c", sql, schema());
             assert!(
                 matches!(constraint.support, ConstraintSupport::Unsupported(_)),
-                "expected '{sql}' to be connector-enforced"
+                "expected '{sql}' to be unparsable"
             );
             assert!(constraint.predicate().is_none());
             assert_eq!(constraint.raw_sql(), sql, "raw sql must round-trip");

@@ -567,19 +567,28 @@ impl<S> Transaction<S> {
     /// constraints fails unless this method was called (see [`Self::commit`]); this is how kernel
     /// keeps a connector unaware of the feature from silently committing violating data.
     ///
-    /// Custom engines start with the set-level question and branch:
+    /// Kernel does not say which constraints are the connector's to enforce -- it reports, per
+    /// constraint, the parsed [`predicate`](crate::check_constraints::CheckConstraint::predicate)
+    /// (when kernel could parse it) and the always-present
+    /// [`raw_sql`](crate::check_constraints::CheckConstraint::raw_sql). A connector that can
+    /// evaluate everything kernel parsed uses the set-level fast path; otherwise it iterates and
+    /// decides per constraint:
     ///
     /// ```ignore
     /// let constraints = txn.check_constraints();
     /// if constraints.is_kernel_parsable() {
-    ///     // Build a validator once and run it over the full logical batch BEFORE partitioning
-    ///     // (partition columns are present as ordinary data), then partition and write.
+    ///     // Every constraint has a predicate: build one validator and run it over the full
+    ///     // logical batch BEFORE partitioning (partition columns are present as ordinary data),
+    ///     // then partition and write.
     ///     let validator = constraints.validator(engine.evaluation_handler().as_ref())?;
     ///     validator.validate(&batch)?;
     /// } else {
-    ///     // Kernel cannot evaluate some constraints; evaluate their raw SQL yourself or fail.
-    ///     for constraint in constraints.connector_enforced() {
-    ///         my_sql_engine.enforce(constraint.raw_sql(), &batch)?;
+    ///     // Some constraints have no predicate; branch per constraint.
+    ///     for constraint in constraints.iter() {
+    ///         match constraint.predicate() {
+    ///             Some(_) => constraint.validate(&batch, engine.evaluation_handler().as_ref())?,
+    ///             None => my_sql_engine.enforce(constraint.raw_sql(), &batch)?,
+    ///         }
     ///     }
     /// }
     /// ```
@@ -600,8 +609,8 @@ impl<S> Transaction<S> {
     fn parsed_check_constraints(&self) -> &crate::check_constraints::CheckConstraints {
         self.parsed_check_constraints.get_or_init(|| {
             let table_config = &self.effective_table_config;
-            crate::check_constraints::constraints_from_configuration(
-                table_config.metadata().configuration(),
+            crate::check_constraints::constraints_from_properties(
+                &table_config.table_properties().check_constraints,
                 table_config.logical_schema(),
             )
         })
@@ -612,9 +621,11 @@ impl<S> Transaction<S> {
     #[cfg(feature = "check-constraints-in-dev")]
     fn ensure_check_constraints_acknowledged(&self) -> DeltaResult<()> {
         if !self.check_constraints_acknowledged.load(Ordering::Relaxed)
-            && crate::check_constraints::has_check_constraints(
-                self.effective_table_config.metadata().configuration(),
-            )
+            && !self
+                .effective_table_config
+                .table_properties()
+                .check_constraints
+                .is_empty()
         {
             return Err(Error::unsupported(
                 "table has CHECK constraints (delta.constraints.*); the connector must enforce \

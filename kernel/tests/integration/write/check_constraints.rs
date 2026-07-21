@@ -275,13 +275,16 @@ mod enabled {
         let constraints = txn.check_constraints();
         assert!(!constraints.is_kernel_parsable());
 
-        // No: connector_enforced() exposes the raw SQL for the connector to evaluate itself
-        // (a connector with no SQL engine must instead refuse to write).
-        let raw: Vec<_> = constraints.connector_enforced().collect();
+        // No: kernel does not hand back a connector-owned subset -- the connector iterates and
+        // finds the constraint has no predicate, so only its raw SQL is available for it to
+        // evaluate itself (a connector with no SQL engine must instead refuse to write).
+        let raw: Vec<_> = constraints
+            .iter()
+            .filter(|c| c.predicate().is_none())
+            .collect();
         let [raw] = raw[..] else {
-            panic!("table has exactly one connector-enforced constraint");
+            panic!("table has exactly one unparsable constraint");
         };
-        assert!(raw.predicate().is_none());
         assert_eq!(raw.raw_sql(), "amount > 0 AND amount < 100");
 
         // Kernel cannot evaluate it, so building a validator fails closed -- a DefaultEngine

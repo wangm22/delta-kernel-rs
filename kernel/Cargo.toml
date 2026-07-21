@@ -169,12 +169,20 @@ tracing-subscriber = { version = "0.3", default-features = false, features = [
 ] }
 rstest = "0.23"
 rstest_reuse = "0.7"
+# Drive async default-engine writes (write_parquet) from sync criterion benches. The `tokio`
+# dependency above is optional and only enabled with the "tokio" feature, so benches need their
+# own non-optional handle to a runtime.
+tokio = { version = "1.47", features = ["rt-multi-thread"] }
 [[bench]]
 name = "metadata_bench"
 harness = false
 
 [[bench]]
 name = "expression_bench"
+harness = false
+
+[[bench]]
+name = "check_constraint_write_bench"
 harness = false
 
 # Single integration test binary. Linking each integration test as a separate
