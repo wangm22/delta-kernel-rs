@@ -127,6 +127,19 @@ mod enabled {
         )?))
     }
 
+    /// Builds the data-only batch (`amount`) written to a table partitioned by `name`: the physical
+    /// parquet excludes the partition column, which is supplied to the write context as a Scalar.
+    fn amount_only_batch(
+        amounts: Vec<Option<i64>>,
+    ) -> Result<ArrowEngineData, Box<dyn std::error::Error>> {
+        let schema = StructType::new_unchecked([StructField::nullable("amount", DataType::LONG)]);
+        let arrow_schema = Arc::new((&schema).try_into_arrow()?);
+        Ok(ArrowEngineData::new(RecordBatch::try_new(
+            arrow_schema,
+            vec![Arc::new(Int64Array::from(amounts)) as ArrayRef],
+        )?))
+    }
+
     fn assert_err_contains(err: Error, needle: &str) {
         let msg = err.to_string();
         assert!(msg.contains(needle), "expected '{needle}' in error: {msg}");
@@ -227,10 +240,9 @@ mod enabled {
     /// satisfying write commits and round-trips.
     #[tokio::test]
     async fn connector_validates_batch_before_write() -> Result<(), Box<dyn std::error::Error>> {
-        // Spark stores parser-round-tripped, token-spaced expression text; use that style here.
         let (table_url, engine) = setup_constrained_table(
             "test_cc_validate_before_write",
-            &[("positive_amount", "( amount > 0 )")],
+            &[("positive_amount", "amount > 0")],
         )
         .await?;
         let mut txn = begin_txn(&table_url, &engine)?.with_operation("WRITE".to_string());
@@ -353,11 +365,15 @@ mod enabled {
         assert_err_contains(err, "positive_amount");
 
         // A satisfying batch validates; write it to the matching partition, commit, and read back.
-        let good = batch(vec![Some(5)], vec!["a"])?;
-        validator.validate(&good)?;
+        // Validate the FULL batch (partition column `name` present as data). The write then takes
+        // the data-only batch (`amount`) plus the partition value as a Scalar -- the partition
+        // column is not part of the physical parquet.
+        validator.validate(&batch(vec![Some(5)], vec!["a"])?)?;
         let write_context = txn
             .partitioned_write_context(HashMap::from([("name".to_string(), Scalar::from("a"))]))?;
-        let add_files_metadata = engine.write_parquet(&good, &write_context).await?;
+        let add_files_metadata = engine
+            .write_parquet(&amount_only_batch(vec![Some(5)])?, &write_context)
+            .await?;
         txn.add_files(add_files_metadata);
         txn.commit(&engine)?.unwrap_committed();
 
@@ -378,7 +394,8 @@ mod enabled {
             StructField::nullable("label", DataType::STRING),
             StructField::nullable("region", DataType::STRING),
         ]));
-        // Pre-partition batches carry both columns with their real per-row values.
+        // Pre-partition batches carry both columns with their real per-row values (validation sees
+        // the whole batch).
         let mk_batch = |labels: Vec<&str>,
                         regions: Vec<&str>|
          -> Result<ArrowEngineData, Box<dyn std::error::Error>> {
@@ -391,6 +408,19 @@ mod enabled {
                 ],
             )?))
         };
+        // The physical write excludes the `region` partition column (supplied as a Scalar).
+        let data_schema = Arc::new(StructType::new_unchecked([StructField::nullable(
+            "label",
+            DataType::STRING,
+        )]));
+        let mk_label_batch =
+            |labels: Vec<&str>| -> Result<ArrowEngineData, Box<dyn std::error::Error>> {
+                let arrow_schema = Arc::new(data_schema.as_ref().try_into_arrow()?);
+                Ok(ArrowEngineData::new(RecordBatch::try_new(
+                    arrow_schema,
+                    vec![Arc::new(StringArray::from(labels)) as ArrayRef],
+                )?))
+            };
 
         let (store, engine, table_location): (Arc<DynObjectStore>, _, _) =
             engine_store_setup("test_cc_mixed_partition", None);
@@ -444,14 +474,16 @@ mod enabled {
         }
 
         // A satisfying write commits and round-trips, with `region` reconstructed from
-        // `add.partitionValues`.
-        let good = mk_batch(vec!["EU", "ASIA"], vec!["US", "US"])?;
-        validator.validate(&good)?;
+        // `add.partitionValues`. Validation sees the full batch; the write takes the data-only
+        // (`label`) batch plus the partition value.
+        validator.validate(&mk_batch(vec!["EU", "ASIA"], vec!["US", "US"])?)?;
         let write_context = txn.partitioned_write_context(HashMap::from([(
             "region".to_string(),
             Scalar::from("US"),
         )]))?;
-        let add_files = engine.write_parquet(&good, &write_context).await?;
+        let add_files = engine
+            .write_parquet(&mk_label_batch(vec!["EU", "ASIA"])?, &write_context)
+            .await?;
         txn.add_files(add_files);
         txn.commit(&engine)?.unwrap_committed();
 

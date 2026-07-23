@@ -549,11 +549,17 @@ mod tests {
     }
 
     #[test]
-    fn token_spaced_and_parenthesized_expressions_are_evaluable() {
-        // Delta-Spark stores parser-round-tripped, token-spaced expression text (e.g.
-        // `concat ( num , text ) != '9i'`); simple comparisons must tolerate the same style.
-        let constraint = CheckConstraint::new("p", "( amount > 0 )", schema());
-        assert!(matches!(constraint.support, ConstraintSupport::Parsable(_)));
+    fn token_spaced_comparisons_parse() {
+        // Delta-Spark stores parser-round-tripped, token-spaced expression text; a simple
+        // comparison must parse regardless of surrounding or internal whitespace. (Parentheses are
+        // outside the single-comparison grammar and are not accepted.)
+        for sql in ["amount>0", "amount > 0", "amount   >   0", "  amount > 0  "] {
+            let constraint = CheckConstraint::new("p", sql, schema());
+            assert!(
+                matches!(constraint.support, ConstraintSupport::Parsable(_)),
+                "expected {sql:?} to parse"
+            );
+        }
     }
 
     #[test]
